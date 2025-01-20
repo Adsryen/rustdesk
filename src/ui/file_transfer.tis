@@ -245,7 +245,13 @@ class JobTable: Reactor.Component {
     var percent = job.total_size == 0 ? 100 : (100. * job.finished_size / job.total_size).toInteger(); // (100. * i / (n || 1)).toInteger();
     if (job.finished) percent = '100';
     if (percent) res += ", " + percent + "%";
-    if (job.finished) res = translate("Finished") + " " + res;
+    if (job.finished) {
+      if (job.err == "skipped") {
+        res = translate("Skipped") + " " + res;
+      } else {
+        res = translate("Finished") + " " + res;
+      }
+    }
     if (job.speed) res += ", " + getSize(0, job.speed) + "/s";
     return res;
   }
@@ -268,9 +274,10 @@ class JobTable: Reactor.Component {
     if (file_num < job.file_num) return;
     job.file_num = file_num;
     var n = job.num_entries || job.entries.length;
-    job.finished = job.file_num >= n - 1 || err == "cancel";
+    job.finished = job.file_num >= n - 1 || err == "cancel" || err == "skipped";
     job.finished_size = finished_size;
     job.speed = speed || 0;
+    job.err = err;
     this.updateJob(job);
     if (job.type == "del-dir") {
       if (job.finished) {
@@ -535,7 +542,7 @@ class FolderView : Reactor.Component {
       msgbox("custom", translate("Create Folder"), "<div .form> \
             <div>" + translate("Please enter the folder name") + ":</div> \
             <div><input|text(name) .outline-focus /></div> \
-        </div>", function(res=null) {
+        </div>", "", function(res=null) {
           if (!res) return;
           if (!res.name) return;
           var name = res.name.trim();
@@ -716,7 +723,7 @@ function confirmDelete(id ,path, is_remote) {
   msgbox("custom-skip", "Confirm Delete", "<div .form> \
         <div>" + translate('Are you sure you want to delete this file?') + "</div> \
         <div.ellipsis style=\"font-weight: bold;\">" + path + "</div> \
-    </div>", function(res=null) {
+    </div>", "", function(res=null) {
       if (!res) {
         file_transfer.job_table.updateJobStatus(id, -1, "cancel");
         file_transfer.job_table.cancelDeletePolling();
@@ -746,7 +753,7 @@ handler.confirmDeleteFiles = function(id, i, name) {
         <div>" + translate('Are you sure you want to delete this file?') + "</div> \
         <div.ellipsis style=\"font-weight: bold;\" .text>" + file_path + "</div> \
         <div><button|checkbox(remember) {ts}>" + translate('Do this for all conflicts') + "</button></div> \
-    </div>", function(res=null) {
+    </div>", "", function(res=null) {
       if (!res) {
         jt.updateJobStatus(id, i - 1, "cancel");
         file_transfer.job_table.cancelDeletePolling();
@@ -771,14 +778,16 @@ handler.confirmDeleteFiles = function(id, i, name) {
     });
 }
 
-handler.overrideFileConfirm = function(id, file_num, to, is_upload) {
+handler.overrideFileConfirm = function(id, file_num, to, is_upload, is_identical) {
   var jt = file_transfer.job_table;
+  var identical_msg = is_identical ? translate("identical_file_tip"): "";
   msgbox("custom-skip", "Confirm Write Strategy", "<div .form> \
-        <div>" + translate('Overwrite') + translate('files') + ".</div> \
+        <div>" + translate('Overwrite') + " " + translate('files') + ".</div> \
         <div>" + translate('This file exists, skip or overwrite this file?') + "</div> \
         <div.ellipsis style=\"font-weight: bold;\" .text>" + to + "</div> \
+        <div>" + identical_msg + "</div> \
         <div><button|checkbox(remember) {ts}>" + translate('Do this for all conflicts') + "</button></div> \
-    </div>", function(res=null) {
+    </div>", "", function(res=null) {
       if (!res) {
         jt.updateJobStatus(id, -1, "cancel");
         handler.cancel_job(id);

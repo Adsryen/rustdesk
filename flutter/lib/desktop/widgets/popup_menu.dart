@@ -3,6 +3,7 @@ import 'dart:core';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 
+import '../../common.dart';
 import './material_mod_popup_menu.dart' as mod_menu;
 
 // https://stackoverflow.com/questions/68318314/flutter-popup-menu-inside-popup-menu
@@ -37,18 +38,16 @@ class PopupMenuChildrenItem<T> extends mod_menu.PopupMenuEntry<T> {
 
   @override
   MyPopupMenuItemState<T, PopupMenuChildrenItem<T>> createState() =>
-      MyPopupMenuItemState<T, PopupMenuChildrenItem<T>>();
+      MyPopupMenuItemState<T, PopupMenuChildrenItem<T>>(enabled?.value);
 }
 
 class MyPopupMenuItemState<T, W extends PopupMenuChildrenItem<T>>
     extends State<W> {
   RxBool enabled = true.obs;
 
-  @override
-  void initState() {
-    super.initState();
-    if (widget.enabled != null) {
-      enabled.value = widget.enabled!.value;
+  MyPopupMenuItemState(bool? e) {
+    if (e != null) {
+      enabled.value = e;
     }
   }
 
@@ -64,7 +63,7 @@ class MyPopupMenuItemState<T, W extends PopupMenuChildrenItem<T>>
     final PopupMenuThemeData popupMenuTheme = PopupMenuTheme.of(context);
     TextStyle style = widget.textStyle ??
         popupMenuTheme.textStyle ??
-        theme.textTheme.subtitle1!;
+        theme.textTheme.titleMedium!;
     return Obx(() => mod_menu.PopupMenuButton<T>(
           enabled: enabled.value,
           position: widget.position,
@@ -98,23 +97,38 @@ class MenuConfig {
 
   final double height;
   final double dividerHeight;
+  final double? boxWidth;
   final Color commonColor;
 
   const MenuConfig(
       {required this.commonColor,
       this.height = kMinInteractiveDimension,
-      this.dividerHeight = 16.0});
+      this.dividerHeight = 16.0,
+      this.boxWidth});
 }
+
+typedef DismissCallback = Function();
 
 abstract class MenuEntryBase<T> {
   bool dismissOnClicked;
+  DismissCallback? dismissCallback;
   RxBool? enabled;
 
   MenuEntryBase({
     this.dismissOnClicked = false,
     this.enabled,
+    this.dismissCallback,
   });
   List<mod_menu.PopupMenuEntry<T>> build(BuildContext context, MenuConfig conf);
+
+  enabledStyle(BuildContext context) => TextStyle(
+      color: Theme.of(context).textTheme.titleLarge?.color,
+      fontSize: MenuConfig.fontSize,
+      fontWeight: FontWeight.normal);
+  disabledStyle() => TextStyle(
+      color: Colors.grey,
+      fontSize: MenuConfig.fontSize,
+      fontWeight: FontWeight.normal);
 }
 
 class MenuEntryDivider<T> extends MenuEntryBase<T> {
@@ -134,12 +148,14 @@ class MenuEntryRadioOption {
   String value;
   bool dismissOnClicked;
   RxBool? enabled;
+  DismissCallback? dismissCallback;
 
   MenuEntryRadioOption({
     required this.text,
     required this.value,
     this.dismissOnClicked = false,
     this.enabled,
+    this.dismissCallback,
   });
 }
 
@@ -165,8 +181,13 @@ class MenuEntryRadios<T> extends MenuEntryBase<T> {
     required this.optionSetter,
     this.padding,
     dismissOnClicked = false,
+    dismissCallback,
     RxBool? enabled,
-  }) : super(dismissOnClicked: dismissOnClicked, enabled: enabled) {
+  }) : super(
+          dismissOnClicked: dismissOnClicked,
+          enabled: enabled,
+          dismissCallback: dismissCallback,
+        ) {
     () async {
       _curOption.value = await curOptionGetter();
     }();
@@ -186,51 +207,78 @@ class MenuEntryRadios<T> extends MenuEntryBase<T> {
 
   mod_menu.PopupMenuEntry<T> _buildMenuItem(
       BuildContext context, MenuConfig conf, MenuEntryRadioOption opt) {
+    Widget getTextChild() {
+      final enabledTextChild = Text(
+        opt.text,
+        style: enabledStyle(context),
+      );
+      final disabledTextChild = Text(
+        opt.text,
+        style: disabledStyle(),
+      );
+      if (opt.enabled == null) {
+        return enabledTextChild;
+      } else {
+        return Obx(
+            () => opt.enabled!.isTrue ? enabledTextChild : disabledTextChild);
+      }
+    }
+
+    final child = Container(
+      padding: padding,
+      alignment: AlignmentDirectional.centerStart,
+      constraints:
+          BoxConstraints(minHeight: conf.height, maxHeight: conf.height),
+      child: Row(
+        children: [
+          getTextChild(),
+          Expanded(
+              child: Align(
+                  alignment: Alignment.centerRight,
+                  child: Transform.scale(
+                    scale: MenuConfig.iconScale,
+                    child: Obx(() => opt.value == curOption.value
+                        ? IconButton(
+                            padding:
+                                const EdgeInsets.fromLTRB(8.0, 0.0, 8.0, 0.0),
+                            hoverColor: Colors.transparent,
+                            focusColor: Colors.transparent,
+                            onPressed: () {},
+                            icon: Icon(
+                              Icons.check,
+                              color: (opt.enabled ?? true.obs).isTrue
+                                  ? conf.commonColor
+                                  : Colors.grey,
+                            ))
+                        : const SizedBox.shrink()),
+                  ))),
+        ],
+      ),
+    );
+    onPressed() {
+      if (opt.dismissOnClicked && Navigator.canPop(context)) {
+        Navigator.pop(context);
+        if (opt.dismissCallback != null) {
+          opt.dismissCallback!();
+        }
+      }
+      setOption(opt.value);
+    }
+
     return mod_menu.PopupMenuItem(
       padding: EdgeInsets.zero,
       height: conf.height,
-      child: TextButton(
-        child: Container(
-          padding: padding,
-          alignment: AlignmentDirectional.centerStart,
-          constraints:
-              BoxConstraints(minHeight: conf.height, maxHeight: conf.height),
-          child: Row(
-            children: [
-              Text(
-                opt.text,
-                style: TextStyle(
-                    color: Theme.of(context).textTheme.titleLarge?.color,
-                    fontSize: MenuConfig.fontSize,
-                    fontWeight: FontWeight.normal),
-              ),
-              Expanded(
-                  child: Align(
-                      alignment: Alignment.centerRight,
-                      child: Transform.scale(
-                        scale: MenuConfig.iconScale,
-                        child: Obx(() => opt.value == curOption.value
-                            ? IconButton(
-                                padding: const EdgeInsets.fromLTRB(
-                                    8.0, 0.0, 8.0, 0.0),
-                                hoverColor: Colors.transparent,
-                                focusColor: Colors.transparent,
-                                onPressed: () {},
-                                icon: Icon(
-                                  Icons.check,
-                                  color: conf.commonColor,
-                                ))
-                            : const SizedBox.shrink()),
-                      ))),
-            ],
-          ),
-        ),
-        onPressed: () {
-          if (opt.dismissOnClicked && Navigator.canPop(context)) {
-            Navigator.pop(context);
-          }
-          setOption(opt.value);
-        },
+      child: Container(
+        width: conf.boxWidth,
+        child: opt.enabled == null
+            ? TextButton(
+                child: child,
+                onPressed: onPressed,
+              )
+            : Obx(() => TextButton(
+                  child: child,
+                  onPressed: opt.enabled!.isTrue ? onPressed : null,
+                )),
       ),
     );
   }
@@ -284,48 +332,53 @@ class MenuEntrySubRadios<T> extends MenuEntryBase<T> {
     return mod_menu.PopupMenuItem(
       padding: EdgeInsets.zero,
       height: conf.height,
-      child: TextButton(
-        child: Container(
-          padding: padding,
-          alignment: AlignmentDirectional.centerStart,
-          constraints:
-              BoxConstraints(minHeight: conf.height, maxHeight: conf.height),
-          child: Row(
-            children: [
-              Text(
-                opt.text,
-                style: TextStyle(
-                    color: Theme.of(context).textTheme.titleLarge?.color,
-                    fontSize: MenuConfig.fontSize,
-                    fontWeight: FontWeight.normal),
+      child: Container(
+          width: conf.boxWidth,
+          child: TextButton(
+            child: Container(
+              padding: padding,
+              alignment: AlignmentDirectional.centerStart,
+              constraints: BoxConstraints(
+                  minHeight: conf.height, maxHeight: conf.height),
+              child: Row(
+                children: [
+                  Text(
+                    opt.text,
+                    style: TextStyle(
+                        color: Theme.of(context).textTheme.titleLarge?.color,
+                        fontSize: MenuConfig.fontSize,
+                        fontWeight: FontWeight.normal),
+                  ),
+                  Expanded(
+                      child: Align(
+                    alignment: Alignment.centerRight,
+                    child: Transform.scale(
+                        scale: MenuConfig.iconScale,
+                        child: Obx(() => opt.value == curOption.value
+                            ? IconButton(
+                                padding: EdgeInsets.zero,
+                                hoverColor: Colors.transparent,
+                                focusColor: Colors.transparent,
+                                onPressed: () {},
+                                icon: Icon(
+                                  Icons.check,
+                                  color: conf.commonColor,
+                                ))
+                            : const SizedBox.shrink())),
+                  )),
+                ],
               ),
-              Expanded(
-                  child: Align(
-                alignment: Alignment.centerRight,
-                child: Transform.scale(
-                    scale: MenuConfig.iconScale,
-                    child: Obx(() => opt.value == curOption.value
-                        ? IconButton(
-                            padding: EdgeInsets.zero,
-                            hoverColor: Colors.transparent,
-                            focusColor: Colors.transparent,
-                            onPressed: () {},
-                            icon: Icon(
-                              Icons.check,
-                              color: conf.commonColor,
-                            ))
-                        : const SizedBox.shrink())),
-              )),
-            ],
-          ),
-        ),
-        onPressed: () {
-          if (opt.dismissOnClicked && Navigator.canPop(context)) {
-            Navigator.pop(context);
-          }
-          setOption(opt.value);
-        },
-      ),
+            ),
+            onPressed: () {
+              if (opt.dismissOnClicked && Navigator.canPop(context)) {
+                Navigator.pop(context);
+                if (opt.dismissCallback != null) {
+                  opt.dismissCallback!();
+                }
+              }
+              setOption(opt.value);
+            },
+          )),
     );
   }
 
@@ -383,10 +436,24 @@ abstract class MenuEntrySwitchBase<T> extends MenuEntryBase<T> {
     this.textStyle,
     this.padding,
     RxBool? enabled,
-  }) : super(dismissOnClicked: dismissOnClicked, enabled: enabled);
+    dismissCallback,
+  }) : super(
+          dismissOnClicked: dismissOnClicked,
+          enabled: enabled,
+          dismissCallback: dismissCallback,
+        );
+
+  bool get isEnabled => enabled?.value ?? true;
 
   RxBool get curOption;
   Future<void> setOption(bool? option);
+
+  tryPop(BuildContext context) {
+    if (dismissOnClicked && Navigator.canPop(context)) {
+      Navigator.pop(context);
+      super.dismissCallback?.call();
+    }
+  }
 
   @override
   List<mod_menu.PopupMenuEntry<T>> build(
@@ -400,55 +467,55 @@ abstract class MenuEntrySwitchBase<T> extends MenuEntryBase<T> {
       mod_menu.PopupMenuItem(
         padding: EdgeInsets.zero,
         height: conf.height,
-        child: TextButton(
-          child: Container(
-              padding: padding,
-              alignment: AlignmentDirectional.centerStart,
-              height: conf.height,
-              child: Row(children: [
-                Obx(() => Text(
-                      text,
-                      style: textStyle!.value,
-                    )),
-                Expanded(
-                    child: Align(
-                  alignment: Alignment.centerRight,
-                  child: Transform.scale(
-                      scale: MenuConfig.iconScale,
-                      child: Obx(() {
-                        if (switchType == SwitchType.sswitch) {
-                          return Switch(
-                            value: curOption.value,
-                            onChanged: (v) {
-                              if (super.dismissOnClicked &&
-                                  Navigator.canPop(context)) {
-                                Navigator.pop(context);
-                              }
-                              setOption(v);
-                            },
-                          );
-                        } else {
-                          return Checkbox(
-                            value: curOption.value,
-                            onChanged: (v) {
-                              if (super.dismissOnClicked &&
-                                  Navigator.canPop(context)) {
-                                Navigator.pop(context);
-                              }
-                              setOption(v);
-                            },
-                          );
-                        }
-                      })),
-                ))
-              ])),
-          onPressed: () {
-            if (super.dismissOnClicked && Navigator.canPop(context)) {
-              Navigator.pop(context);
-            }
-            setOption(!curOption.value);
-          },
-        ),
+        child: Container(
+            width: conf.boxWidth,
+            child: TextButton(
+              child: Container(
+                  padding: padding,
+                  alignment: AlignmentDirectional.centerStart,
+                  height: conf.height,
+                  child: Row(children: [
+                    Obx(() => Text(
+                          text,
+                          style: textStyle!.value,
+                        )),
+                    Expanded(
+                        child: Align(
+                      alignment: Alignment.centerRight,
+                      child: Transform.scale(
+                          scale: MenuConfig.iconScale,
+                          child: Obx(() {
+                            if (switchType == SwitchType.sswitch) {
+                              return Switch(
+                                value: curOption.value,
+                                onChanged: isEnabled
+                                    ? (v) {
+                                        tryPop(context);
+                                        setOption(v);
+                                      }
+                                    : null,
+                              );
+                            } else {
+                              return Checkbox(
+                                value: curOption.value,
+                                onChanged: isEnabled
+                                    ? (v) {
+                                        tryPop(context);
+                                        setOption(v);
+                                      }
+                                    : null,
+                              );
+                            }
+                          })),
+                    ))
+                  ])),
+              onPressed: isEnabled
+                  ? () {
+                      tryPop(context);
+                      setOption(!curOption.value);
+                    }
+                  : null,
+            )),
       )
     ];
   }
@@ -468,6 +535,7 @@ class MenuEntrySwitch<T> extends MenuEntrySwitchBase<T> {
     EdgeInsets? padding,
     dismissOnClicked = false,
     RxBool? enabled,
+    dismissCallback,
   }) : super(
           switchType: switchType,
           text: text,
@@ -475,6 +543,7 @@ class MenuEntrySwitch<T> extends MenuEntrySwitchBase<T> {
           padding: padding,
           dismissOnClicked: dismissOnClicked,
           enabled: enabled,
+          dismissCallback: dismissCallback,
         ) {
     () async {
       _curOption.value = await getter();
@@ -490,6 +559,47 @@ class MenuEntrySwitch<T> extends MenuEntrySwitchBase<T> {
       final opt = await getter();
       if (_curOption.value != opt) {
         _curOption.value = opt;
+      }
+    }
+  }
+}
+
+// Compatible with MenuEntrySwitch, it uses value instead of getter
+class MenuEntrySwitchSync<T> extends MenuEntrySwitchBase<T> {
+  final SwitchSetter setter;
+  final RxBool _curOption = false.obs;
+
+  MenuEntrySwitchSync({
+    required SwitchType switchType,
+    required String text,
+    required bool currentValue,
+    required this.setter,
+    Rx<TextStyle>? textStyle,
+    EdgeInsets? padding,
+    dismissOnClicked = false,
+    RxBool? enabled,
+    dismissCallback,
+  }) : super(
+          switchType: switchType,
+          text: text,
+          textStyle: textStyle,
+          padding: padding,
+          dismissOnClicked: dismissOnClicked,
+          enabled: enabled,
+          dismissCallback: dismissCallback,
+        ) {
+    _curOption.value = currentValue;
+  }
+
+  @override
+  RxBool get curOption => _curOption;
+  @override
+  setOption(bool? option) async {
+    if (option != null) {
+      await setter(option);
+      // Notice: no ensure with getter, best used on menus that are destroyed on click
+      if (_curOption.value != option) {
+        _curOption.value = option;
       }
     }
   }
@@ -511,12 +621,15 @@ class MenuEntrySwitch2<T> extends MenuEntrySwitchBase<T> {
     EdgeInsets? padding,
     dismissOnClicked = false,
     RxBool? enabled,
+    dismissCallback,
   }) : super(
-            switchType: switchType,
-            text: text,
-            textStyle: textStyle,
-            padding: padding,
-            dismissOnClicked: dismissOnClicked);
+          switchType: switchType,
+          text: text,
+          textStyle: textStyle,
+          padding: padding,
+          dismissOnClicked: dismissOnClicked,
+          dismissCallback: dismissCallback,
+        );
 
   @override
   RxBool get curOption => getter();
@@ -558,12 +671,9 @@ class MenuEntrySubMenu<T> extends MenuEntryBase<T> {
           const SizedBox(width: MenuConfig.midPadding),
           Obx(() => Text(
                 text,
-                style: TextStyle(
-                    color: super.enabled!.value
-                        ? Theme.of(context).textTheme.titleLarge?.color
-                        : Colors.grey,
-                    fontSize: MenuConfig.fontSize,
-                    fontWeight: FontWeight.normal),
+                style: super.enabled!.value
+                    ? enabledStyle(context)
+                    : disabledStyle(),
               )),
           Expanded(
               child: Align(
@@ -590,26 +700,25 @@ class MenuEntryButton<T> extends MenuEntryBase<T> {
     this.padding,
     dismissOnClicked = false,
     RxBool? enabled,
+    dismissCallback,
   }) : super(
           dismissOnClicked: dismissOnClicked,
           enabled: enabled,
+          dismissCallback: dismissCallback,
         );
 
   Widget _buildChild(BuildContext context, MenuConfig conf) {
-    final enabledStyle = TextStyle(
-        color: Theme.of(context).textTheme.titleLarge?.color,
-        fontSize: MenuConfig.fontSize,
-        fontWeight: FontWeight.normal);
-    const disabledStyle = TextStyle(
-        color: Colors.grey,
-        fontSize: MenuConfig.fontSize,
-        fontWeight: FontWeight.normal);
     super.enabled ??= true.obs;
-    return Obx(() => TextButton(
+    return Obx(() => Container(
+        width: conf.boxWidth,
+        child: TextButton(
           onPressed: super.enabled!.value
               ? () {
                   if (super.dismissOnClicked && Navigator.canPop(context)) {
                     Navigator.pop(context);
+                    if (super.dismissCallback != null) {
+                      super.dismissCallback!();
+                    }
                   }
                   proc();
                 }
@@ -620,9 +729,9 @@ class MenuEntryButton<T> extends MenuEntryBase<T> {
             constraints:
                 BoxConstraints(minHeight: conf.height, maxHeight: conf.height),
             child: childBuilder(
-                super.enabled!.value ? enabledStyle : disabledStyle),
+                super.enabled!.value ? enabledStyle(context) : disabledStyle()),
           ),
-        ));
+        )));
   }
 
   @override
@@ -636,4 +745,11 @@ class MenuEntryButton<T> extends MenuEntryBase<T> {
       )
     ];
   }
+}
+
+class CustomPopupMenuTheme {
+  static const Color commonColor = MyTheme.accent;
+  // kMinInteractiveDimension
+  static const double height = 20.0;
+  static const double dividerHeight = 3.0;
 }

@@ -1,17 +1,16 @@
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
+import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:get/get.dart';
-import 'package:wakelock/wakelock.dart';
 
 const double _kColumn1Width = 30;
 const double _kColumn4Width = 100;
-const double _kRowHeight = 50;
+const double _kRowHeight = 60;
 const double _kTextLeftMargin = 20;
 
 class _PortForward {
@@ -26,10 +25,23 @@ class _PortForward {
 }
 
 class PortForwardPage extends StatefulWidget {
-  const PortForwardPage({Key? key, required this.id, required this.isRDP})
-      : super(key: key);
+  const PortForwardPage({
+    Key? key,
+    required this.id,
+    required this.password,
+    required this.tabController,
+    required this.isRDP,
+    required this.isSharedPassword,
+    this.forceRelay,
+    this.connToken,
+  }) : super(key: key);
   final String id;
+  final String? password;
+  final DesktopTabController tabController;
   final bool isRDP;
+  final bool? forceRelay;
+  final bool? isSharedPassword;
+  final String? connToken;
 
   @override
   State<PortForwardPage> createState() => _PortForwardPageState();
@@ -46,22 +58,26 @@ class _PortForwardPageState extends State<PortForwardPage>
   @override
   void initState() {
     super.initState();
-    _ffi = FFI();
-    _ffi.start(widget.id, isPortForward: true);
-    Get.put(_ffi, tag: 'pf_${widget.id}');
-    if (!Platform.isLinux) {
-      Wakelock.enable();
-    }
+    _ffi = FFI(null);
+    _ffi.start(widget.id,
+        isPortForward: true,
+        password: widget.password,
+        isSharedPassword: widget.isSharedPassword,
+        forceRelay: widget.forceRelay,
+        connToken: widget.connToken,
+        isRdp: widget.isRDP);
+    Get.put<FFI>(_ffi, tag: 'pf_${widget.id}');
     debugPrint("Port forward page init success with id ${widget.id}");
+    // Call onSelected in post frame callback, since we cannot guarantee that the callback will not call setState.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      widget.tabController.onSelected?.call(widget.id);
+    });
   }
 
   @override
   void dispose() {
     _ffi.close();
     _ffi.dialogManager.dismissAll();
-    if (!Platform.isLinux) {
-      Wakelock.disable();
-    }
     Get.delete<FFI>(tag: 'pf_${widget.id}');
     super.dispose();
   }
@@ -89,7 +105,7 @@ class _PortForwardPageState extends State<PortForwardPage>
                 Flexible(
                   child: Container(
                     decoration: BoxDecoration(
-                        color: Theme.of(context).backgroundColor,
+                        color: Theme.of(context).colorScheme.background,
                         border: Border.all(width: 1, color: MyTheme.border)),
                     child:
                         widget.isRDP ? buildRdp(context) : buildTunnel(context),
@@ -127,12 +143,13 @@ class _PortForwardPageState extends State<PortForwardPage>
   }
 
   buildTunnel(BuildContext context) {
-    text(String lable) => Expanded(
-        child: Text(translate(lable)).marginOnly(left: _kTextLeftMargin));
+    text(String label) => Expanded(
+        child: Text(translate(label)).marginOnly(left: _kTextLeftMargin));
 
     return Theme(
-      data: Theme.of(context)
-          .copyWith(backgroundColor: Theme.of(context).backgroundColor),
+      data: Theme.of(context).copyWith(
+        colorScheme: Theme.of(context).colorScheme,
+      ),
       child: Obx(() => ListView.builder(
           controller: ScrollController(),
           itemCount: pfs.length + 2,
@@ -167,7 +184,8 @@ class _PortForwardPageState extends State<PortForwardPage>
 
     return Container(
       height: _kRowHeight,
-      decoration: BoxDecoration(color: Theme.of(context).backgroundColor),
+      decoration:
+          BoxDecoration(color: Theme.of(context).colorScheme.background),
       child: Row(children: [
         buildTunnelInputCell(context,
             controller: localPortController,
@@ -179,36 +197,31 @@ class _PortForwardPageState extends State<PortForwardPage>
         buildTunnelInputCell(context,
             controller: remotePortController,
             inputFormatters: portInputFormatter),
-        SizedBox(
-          width: _kColumn4Width,
-          child: ElevatedButton(
-            style: ElevatedButton.styleFrom(
-                elevation: 0, side: const BorderSide(color: MyTheme.border)),
-            onPressed: () async {
-              int? localPort = int.tryParse(localPortController.text);
-              int? remotePort = int.tryParse(remotePortController.text);
-              if (localPort != null &&
-                  remotePort != null &&
-                  (remoteHostController.text.isEmpty ||
-                      remoteHostController.text.trim().isNotEmpty)) {
-                await bind.sessionAddPortForward(
-                    id: 'pf_${widget.id}',
-                    localPort: localPort,
-                    remoteHost: remoteHostController.text.trim().isEmpty
-                        ? 'localhost'
-                        : remoteHostController.text.trim(),
-                    remotePort: remotePort);
-                localPortController.clear();
-                remoteHostController.clear();
-                remotePortController.clear();
-                refreshTunnelConfig();
-              }
-            },
-            child: Text(
-              translate('Add'),
-            ),
-          ).marginAll(10),
-        ),
+        ElevatedButton(
+          onPressed: () async {
+            int? localPort = int.tryParse(localPortController.text);
+            int? remotePort = int.tryParse(remotePortController.text);
+            if (localPort != null &&
+                remotePort != null &&
+                (remoteHostController.text.isEmpty ||
+                    remoteHostController.text.trim().isNotEmpty)) {
+              await bind.sessionAddPortForward(
+                  sessionId: _ffi.sessionId,
+                  localPort: localPort,
+                  remoteHost: remoteHostController.text.trim().isEmpty
+                      ? 'localhost'
+                      : remoteHostController.text.trim(),
+                  remotePort: remotePort);
+              localPortController.clear();
+              remoteHostController.clear();
+              remotePortController.clear();
+              refreshTunnelConfig();
+            }
+          },
+          child: Text(
+            translate('Add'),
+          ),
+        ).marginSymmetric(horizontal: 10),
       ]),
     );
   }
@@ -217,32 +230,21 @@ class _PortForwardPageState extends State<PortForwardPage>
       {required TextEditingController controller,
       List<TextInputFormatter>? inputFormatters,
       String? hint}) {
-    final textColor = Theme.of(context).textTheme.titleLarge?.color;
     return Expanded(
-      child: TextField(
-        controller: controller,
-        inputFormatters: inputFormatters,
-        cursorColor: textColor,
-        cursorHeight: 20,
-        cursorWidth: 1,
-        decoration: InputDecoration(
-            border: OutlineInputBorder(
-                borderSide: BorderSide(color: MyTheme.color(context).border!)),
-            focusedBorder: OutlineInputBorder(
-                borderSide: BorderSide(color: MyTheme.color(context).border!)),
-            fillColor: Theme.of(context).backgroundColor,
-            contentPadding: const EdgeInsets.all(10),
-            hintText: hint,
-            hintStyle:
-                TextStyle(color: Theme.of(context).hintColor, fontSize: 16)),
-        style: TextStyle(color: textColor, fontSize: 16),
-      ).marginAll(10),
+      child: Padding(
+          padding: const EdgeInsets.all(10.0),
+          child: TextField(
+              controller: controller,
+              inputFormatters: inputFormatters,
+              decoration: InputDecoration(
+                hintText: hint,
+              )).workaroundFreezeLinuxMint()),
     );
   }
 
   Widget buildTunnelDataRow(BuildContext context, _PortForward pf, int index) {
-    text(String lable) => Expanded(
-        child: Text(lable, style: const TextStyle(fontSize: 20))
+    text(String label) => Expanded(
+        child: Text(label, style: const TextStyle(fontSize: 20))
             .marginOnly(left: _kTextLeftMargin));
 
     return Container(
@@ -252,7 +254,7 @@ class _PortForwardPageState extends State<PortForwardPage>
               ? MyTheme.currentThemeMode() == ThemeMode.dark
                   ? const Color(0xFF202020)
                   : const Color(0xFFF4F5F6)
-              : Theme.of(context).backgroundColor),
+              : Theme.of(context).colorScheme.background),
       child: Row(children: [
         text(pf.localPort.toString()),
         const SizedBox(width: _kColumn1Width),
@@ -264,7 +266,7 @@ class _PortForwardPageState extends State<PortForwardPage>
             icon: const Icon(Icons.close),
             onPressed: () async {
               await bind.sessionRemovePortForward(
-                  id: 'pf_${widget.id}', localPort: pf.localPort);
+                  sessionId: _ffi.sessionId, localPort: pf.localPort);
               refreshTunnelConfig();
             },
           ),
@@ -274,7 +276,7 @@ class _PortForwardPageState extends State<PortForwardPage>
   }
 
   void refreshTunnelConfig() async {
-    String peer = await bind.mainGetPeer(id: widget.id);
+    String peer = bind.mainGetPeerSync(id: widget.id);
     Map<String, dynamic> config = jsonDecode(peer);
     List<dynamic> infos = config['port_forwards'] as List;
     List<_PortForward> result = List.empty(growable: true);
@@ -285,16 +287,16 @@ class _PortForwardPageState extends State<PortForwardPage>
   }
 
   buildRdp(BuildContext context) {
-    text1(String lable) => Expanded(
-        child: Text(translate(lable)).marginOnly(left: _kTextLeftMargin));
-    text2(String lable) => Expanded(
+    text1(String label) => Expanded(
+        child: Text(translate(label)).marginOnly(left: _kTextLeftMargin));
+    text2(String label) => Expanded(
             child: Text(
-          lable,
+          label,
           style: const TextStyle(fontSize: 20),
         ).marginOnly(left: _kTextLeftMargin));
     return Theme(
       data: Theme.of(context)
-          .copyWith(backgroundColor: Theme.of(context).backgroundColor),
+          .copyWith(colorScheme: Theme.of(context).colorScheme),
       child: ListView.builder(
           controller: ScrollController(),
           itemCount: 2,
@@ -313,8 +315,8 @@ class _PortForwardPageState extends State<PortForwardPage>
             } else {
               return Container(
                 height: _kRowHeight,
-                decoration:
-                    BoxDecoration(color: Theme.of(context).backgroundColor),
+                decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.background),
                 child: Row(children: [
                   Expanded(
                     child: Align(
@@ -322,14 +324,10 @@ class _PortForwardPageState extends State<PortForwardPage>
                       child: SizedBox(
                         width: 120,
                         child: ElevatedButton(
-                          style: ElevatedButton.styleFrom(
-                              elevation: 0,
-                              side: const BorderSide(color: MyTheme.border)),
-                          onPressed: () => bind.sessionNewRdp(id: widget.id),
+                          onPressed: () =>
+                              bind.sessionNewRdp(sessionId: _ffi.sessionId),
                           child: Text(
                             translate('New RDP'),
-                            style: const TextStyle(
-                                fontWeight: FontWeight.w300, fontSize: 14),
                           ),
                         ).marginSymmetric(vertical: 10),
                       ).marginOnly(left: 20),

@@ -1,57 +1,209 @@
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use crate::client::get_key_state;
+use crate::{
+    common::{get_supported_keyboard_modes, is_keyboard_mode_supported},
+    input::{MOUSE_BUTTON_LEFT, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP, MOUSE_TYPE_WHEEL},
+    ui_interface::use_texture_render,
+};
+use async_trait::async_trait;
+use bytes::Bytes;
+use rdev::{Event, EventType::*, KeyCode};
+use std::{
+    collections::HashMap,
+    ffi::c_void,
+    ops::{Deref, DerefMut},
+    str::FromStr,
+    sync::{Arc, Mutex, RwLock},
+    time::SystemTime,
+};
+use uuid::Uuid;
+
+#[cfg(not(feature = "flutter"))]
+use hbb_common::fs;
+use hbb_common::{
+    allow_err,
+    config::{Config, LocalConfig, PeerConfig},
+    get_version_number, log,
+    message_proto::*,
+    rendezvous_proto::ConnType,
+    tokio::{
+        self,
+        sync::mpsc,
+        time::{Duration as TokioDuration, Instant},
+    },
+    Stream,
+};
+
 use crate::client::io_loop::Remote;
 use crate::client::{
-    check_if_retry, handle_hash, handle_login_from_ui, handle_test_delay, input_os_password,
-    load_config, send_mouse, start_video_audio_threads, FileManager, Key, LoginConfigHandler,
-    QualityStatus, KEY_MAP, SERVER_KEYBOARD_ENABLED,
+    check_if_retry, handle_hash, handle_login_error, handle_login_from_ui, handle_test_delay,
+    input_os_password, send_mouse, send_pointer_device_event, FileManager, Key, LoginConfigHandler,
+    QualityStatus, KEY_MAP,
 };
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use crate::common::GrabState;
+use crate::keyboard;
 use crate::{client::Data, client::Interface};
-use async_trait::async_trait;
-use hbb_common::config::{Config, LocalConfig, PeerConfig};
-use hbb_common::rendezvous_proto::ConnType;
-use hbb_common::tokio::{self, sync::mpsc};
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use rdev::Keyboard as RdevKeyboard;
-use rdev::{Event, EventType::*, Key as RdevKey, KeyboardState};
 
-use hbb_common::{allow_err, message_proto::*};
-use hbb_common::{fs, get_version_number, log, Stream};
-use std::collections::{HashMap, HashSet};
-use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-
-/// IS_IN KEYBOARD_HOOKED sciter only
-pub static IS_IN: AtomicBool = AtomicBool::new(false);
-pub static KEYBOARD_HOOKED: AtomicBool = AtomicBool::new(true);
-
-#[cfg(windows)]
-static mut IS_ALT_GR: bool = false;
-
-lazy_static::lazy_static! {
-    static ref TO_RELEASE: Arc<Mutex<HashSet<RdevKey>>> = Arc::new(Mutex::new(HashSet::<RdevKey>::new()));
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-lazy_static::lazy_static! {
-    static ref KEYBOARD: Arc<Mutex<RdevKeyboard>> = Arc::new(Mutex::new(RdevKeyboard::new().unwrap()));
-}
+const CHANGE_RESOLUTION_VALID_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Clone, Default)]
 pub struct Session<T: InvokeUiSession> {
-    pub id: String,
     pub password: String,
     pub args: Vec<String>,
     pub lc: Arc<RwLock<LoginConfigHandler>>,
     pub sender: Arc<RwLock<Option<mpsc::UnboundedSender<Data>>>>,
     pub thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     pub ui_handler: T,
+    pub server_keyboard_enabled: Arc<RwLock<bool>>,
+    pub server_file_transfer_enabled: Arc<RwLock<bool>>,
+    pub server_clipboard_enabled: Arc<RwLock<bool>>,
+    pub last_change_display: Arc<Mutex<ChangeDisplayRecord>>,
+    pub connection_round_state: Arc<Mutex<ConnectionRoundState>>,
+}
+
+#[derive(Clone)]
+pub struct SessionPermissionConfig {
+    pub lc: Arc<RwLock<LoginConfigHandler>>,
+    pub server_keyboard_enabled: Arc<RwLock<bool>>,
+    pub server_file_transfer_enabled: Arc<RwLock<bool>>,
+    pub server_clipboard_enabled: Arc<RwLock<bool>>,
+}
+
+pub struct ChangeDisplayRecord {
+    time: Instant,
+    display: i32,
+    width: i32,
+    height: i32,
+}
+
+enum ConnectionState {
+    Connecting,
+    Connected,
+    Disconnected,
+}
+
+/// ConnectionRoundState is used to control the reconnecting logic.
+pub struct ConnectionRoundState {
+    round: u32,
+    state: ConnectionState,
+}
+
+impl ConnectionRoundState {
+    pub fn new_round(&mut self) -> u32 {
+        self.round += 1;
+        self.state = ConnectionState::Connecting;
+        self.round
+    }
+
+    pub fn set_connected(&mut self) {
+        self.state = ConnectionState::Connected;
+    }
+
+    pub fn is_round_gt(&self, round: u32) -> bool {
+        if round == u32::MAX && self.round == 0 {
+            true
+        } else {
+            round < self.round
+        }
+    }
+
+    pub fn set_disconnected(&mut self, round: u32) -> bool {
+        if self.is_round_gt(round) {
+            false
+        } else {
+            self.state = ConnectionState::Disconnected;
+            true
+        }
+    }
+}
+
+impl Default for ConnectionRoundState {
+    fn default() -> Self {
+        Self {
+            round: 0,
+            state: ConnectionState::Connecting,
+        }
+    }
+}
+
+impl Default for ChangeDisplayRecord {
+    fn default() -> Self {
+        Self {
+            time: Instant::now()
+                - TokioDuration::from_secs(CHANGE_RESOLUTION_VALID_TIMEOUT_SECS + 1),
+            display: 0,
+            width: 0,
+            height: 0,
+        }
+    }
+}
+
+impl ChangeDisplayRecord {
+    fn new(display: i32, width: i32, height: i32) -> Self {
+        Self {
+            time: Instant::now(),
+            display,
+            width,
+            height,
+        }
+    }
+
+    pub fn is_the_same_record(&self, display: i32, width: i32, height: i32) -> bool {
+        self.time.elapsed().as_secs() < CHANGE_RESOLUTION_VALID_TIMEOUT_SECS
+            && self.display == display
+            && self.width == width
+            && self.height == height
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl SessionPermissionConfig {
+    pub fn is_text_clipboard_required(&self) -> bool {
+        *self.server_clipboard_enabled.read().unwrap()
+            && *self.server_keyboard_enabled.read().unwrap()
+            && !self.lc.read().unwrap().disable_clipboard.v
+    }
 }
 
 impl<T: InvokeUiSession> Session<T> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn get_permission_config(&self) -> SessionPermissionConfig {
+        SessionPermissionConfig {
+            lc: self.lc.clone(),
+            server_keyboard_enabled: self.server_keyboard_enabled.clone(),
+            server_file_transfer_enabled: self.server_file_transfer_enabled.clone(),
+            server_clipboard_enabled: self.server_clipboard_enabled.clone(),
+        }
+    }
+
+    pub fn is_file_transfer(&self) -> bool {
+        self.lc
+            .read()
+            .unwrap()
+            .conn_type
+            .eq(&ConnType::FILE_TRANSFER)
+    }
+
+    pub fn is_port_forward(&self) -> bool {
+        let conn_type = self.lc.read().unwrap().conn_type;
+        conn_type == ConnType::PORT_FORWARD || conn_type == ConnType::RDP
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn is_rdp(&self) -> bool {
+        self.lc.read().unwrap().conn_type.eq(&ConnType::RDP)
+    }
+
+    #[cfg(feature = "flutter")]
+    pub fn is_multi_ui_session(&self) -> bool {
+        self.ui_handler.is_multi_ui_session()
+    }
+
     pub fn get_view_style(&self) -> String {
         self.lc.read().unwrap().view_style.clone()
+    }
+
+    pub fn get_scroll_style(&self) -> String {
+        self.lc.read().unwrap().scroll_style.clone()
     }
 
     pub fn get_image_quality(&self) -> String {
@@ -62,23 +214,118 @@ impl<T: InvokeUiSession> Session<T> {
         self.lc.read().unwrap().custom_image_quality.clone()
     }
 
+    pub fn get_peer_version(&self) -> i64 {
+        self.lc.read().unwrap().version.clone()
+    }
+
+    pub fn fallback_keyboard_mode(&self) -> String {
+        let peer_version = self.get_peer_version();
+        let platform = self.peer_platform();
+
+        let supported_modes = get_supported_keyboard_modes(peer_version, &platform);
+        if let Some(mode) = supported_modes.first() {
+            return mode.to_string();
+        } else {
+            if self.get_peer_version() >= get_version_number("1.2.0") {
+                return KeyboardMode::Map.to_string();
+            } else {
+                return KeyboardMode::Legacy.to_string();
+            }
+        }
+    }
+
+    // Caution: This function must be called after peer info is received.
     pub fn get_keyboard_mode(&self) -> String {
-        return std::env::var("KEYBOARD_MODE")
-            .unwrap_or(String::from("legacy"))
-            .to_lowercase();
+        let mode = self.lc.read().unwrap().keyboard_mode.clone();
+        let keyboard_mode = KeyboardMode::from_str(&mode);
+
+        // Note: peer_version is 0 before peer info is received.
+        let peer_version = self.get_peer_version();
+        let platform = self.peer_platform();
+
+        // Saved keyboard mode still exists in this version.
+        if let Ok(mode) = keyboard_mode {
+            if is_keyboard_mode_supported(&mode, peer_version, &platform) {
+                return mode.to_string();
+            }
+        }
+        self.fallback_keyboard_mode()
+    }
+
+    pub fn is_keyboard_mode_supported(&self, mode: String) -> bool {
+        if let Ok(mode) = KeyboardMode::from_str(&mode[..]) {
+            crate::common::is_keyboard_mode_supported(
+                &mode,
+                self.get_peer_version(),
+                &self.peer_platform(),
+            )
+        } else {
+            false
+        }
     }
 
     pub fn save_keyboard_mode(&self, value: String) {
-        std::env::set_var("KEYBOARD_MODE", value);
+        self.lc.write().unwrap().save_keyboard_mode(value);
     }
 
-    pub fn save_view_style(&mut self, value: String) {
+    pub fn get_reverse_mouse_wheel(&self) -> String {
+        self.lc.read().unwrap().reverse_mouse_wheel.clone()
+    }
+
+    pub fn get_displays_as_individual_windows(&self) -> String {
+        self.lc
+            .read()
+            .unwrap()
+            .displays_as_individual_windows
+            .clone()
+    }
+
+    pub fn get_use_all_my_displays_for_the_remote_session(&self) -> String {
+        self.lc
+            .read()
+            .unwrap()
+            .use_all_my_displays_for_the_remote_session
+            .clone()
+    }
+
+    pub fn save_reverse_mouse_wheel(&self, value: String) {
+        self.lc.write().unwrap().save_reverse_mouse_wheel(value);
+    }
+
+    pub fn save_displays_as_individual_windows(&self, value: String) {
+        self.lc
+            .write()
+            .unwrap()
+            .save_displays_as_individual_windows(value);
+    }
+
+    pub fn save_use_all_my_displays_for_the_remote_session(&self, value: String) {
+        self.lc
+            .write()
+            .unwrap()
+            .save_use_all_my_displays_for_the_remote_session(value);
+    }
+
+    pub fn save_view_style(&self, value: String) {
         self.lc.write().unwrap().save_view_style(value);
     }
 
-    pub fn toggle_option(&mut self, name: String) {
+    pub fn save_scroll_style(&self, value: String) {
+        self.lc.write().unwrap().save_scroll_style(value);
+    }
+
+    pub fn save_flutter_option(&self, k: String, v: String) {
+        self.lc.write().unwrap().save_ui_flutter(k, v);
+    }
+
+    pub fn get_flutter_option(&self, k: String) -> String {
+        self.lc.read().unwrap().get_ui_flutter(&k)
+    }
+
+    pub fn toggle_option(&self, name: String) {
         let msg = self.lc.write().unwrap().toggle_option(name.clone());
-        if name == "enable-file-transfer" {
+        #[cfg(not(feature = "flutter"))]
+        if name == hbb_common::config::keys::OPTION_ENABLE_FILE_COPY_PASTE {
             self.send(Data::ToggleClipboardFile);
         }
         if let Some(msg) = msg {
@@ -86,23 +333,71 @@ impl<T: InvokeUiSession> Session<T> {
         }
     }
 
+    pub fn toggle_privacy_mode(&self, impl_key: String, on: bool) {
+        let mut misc = Misc::new();
+        misc.set_toggle_privacy_mode(TogglePrivacyMode {
+            impl_key,
+            on,
+            ..Default::default()
+        });
+        let mut msg_out = Message::new();
+        msg_out.set_misc(misc);
+        self.send(Data::Message(msg_out));
+    }
+
     pub fn get_toggle_option(&self, name: String) -> bool {
         self.lc.read().unwrap().get_toggle_option(&name)
     }
 
+    #[cfg(not(feature = "flutter"))]
     pub fn is_privacy_mode_supported(&self) -> bool {
         self.lc.read().unwrap().is_privacy_mode_supported()
     }
 
-    pub fn refresh_video(&self) {
+    #[cfg(not(target_os = "ios"))]
+    pub fn is_text_clipboard_required(&self) -> bool {
+        *self.server_clipboard_enabled.read().unwrap()
+            && *self.server_keyboard_enabled.read().unwrap()
+            && !self.lc.read().unwrap().disable_clipboard.v
+    }
+
+    #[cfg(feature = "flutter")]
+    pub fn refresh_video(&self, display: i32) {
+        if crate::common::is_support_multi_ui_session_num(self.lc.read().unwrap().version) {
+            self.send(Data::Message(LoginConfigHandler::refresh_display(
+                display as _,
+            )));
+        } else {
+            self.send(Data::Message(LoginConfigHandler::refresh()));
+        }
+    }
+
+    pub fn toggle_virtual_display(&self, index: i32, on: bool) {
+        let mut misc = Misc::new();
+        misc.set_toggle_virtual_display(ToggleVirtualDisplay {
+            display: index,
+            on,
+            ..Default::default()
+        });
+        let mut msg_out = Message::new();
+        msg_out.set_misc(misc);
+        self.send(Data::Message(msg_out));
+    }
+
+    #[cfg(not(feature = "flutter"))]
+    pub fn refresh_video(&self, _display: i32) {
         self.send(Data::Message(LoginConfigHandler::refresh()));
     }
 
-    pub fn record_screen(&self, start: bool, w: i32, h: i32) {
-        self.send(Data::RecordScreen(start, w, h, self.id.clone()));
+    pub fn record_screen(&self, start: bool) {
+        self.send(Data::RecordScreen(start));
     }
 
-    pub fn save_custom_image_quality(&mut self, custom_image_quality: i32) {
+    pub fn is_recording(&self) -> bool {
+        self.lc.read().unwrap().record_state
+    }
+
+    pub fn save_custom_image_quality(&self, custom_image_quality: i32) {
         let msg = self
             .lc
             .write()
@@ -111,17 +406,31 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Message(msg));
     }
 
-    pub fn save_image_quality(&mut self, value: String) {
-        let msg = self.lc.write().unwrap().save_image_quality(value);
+    pub fn save_image_quality(&self, value: String) {
+        let msg = self.lc.write().unwrap().save_image_quality(value.clone());
         if let Some(msg) = msg {
             self.send(Data::Message(msg));
         }
+        if value != "custom" {
+            let last_auto_fps = self.lc.read().unwrap().last_auto_fps;
+            if last_auto_fps.unwrap_or(usize::MAX) >= 30 {
+                // non custom quality use 30 fps
+                let msg = self.lc.write().unwrap().set_custom_fps(30, false);
+                self.send(Data::Message(msg));
+            }
+        }
+    }
+
+    pub fn set_custom_fps(&self, custom_fps: i32) {
+        let msg = self.lc.write().unwrap().set_custom_fps(custom_fps, true);
+        self.send(Data::Message(msg));
     }
 
     pub fn get_remember(&self) -> bool {
         self.lc.read().unwrap().remember
     }
 
+    #[cfg(not(feature = "flutter"))]
     pub fn set_write_override(
         &mut self,
         job_id: i32,
@@ -140,23 +449,36 @@ impl<T: InvokeUiSession> Session<T> {
         true
     }
 
-    pub fn supported_hwcodec(&self) -> (bool, bool) {
-        #[cfg(any(feature = "hwcodec", feature = "mediacodec"))]
-        {
-            let decoder = scrap::codec::Decoder::video_codec_state(&self.id);
-            let mut h264 = decoder.score_h264 > 0;
-            let mut h265 = decoder.score_h265 > 0;
-            let (encoding_264, encoding_265) = self.lc.read().unwrap().supported_encoding.unwrap_or_default();
-            h264 = h264 && encoding_264;
-            h265 = h265 && encoding_265;
-            return (h264, h265);
-        }
-        (false, false)
+    pub fn alternative_codecs(&self) -> (bool, bool, bool, bool) {
+        let luid = self.lc.read().unwrap().adapter_luid;
+        let mark_unsupported = self.lc.read().unwrap().mark_unsupported.clone();
+        let decoder = scrap::codec::Decoder::supported_decodings(
+            None,
+            use_texture_render(),
+            luid,
+            &mark_unsupported,
+        );
+        let mut vp8 = decoder.ability_vp8 > 0;
+        let mut av1 = decoder.ability_av1 > 0;
+        let mut h264 = decoder.ability_h264 > 0;
+        let mut h265 = decoder.ability_h265 > 0;
+        let enc = &self.lc.read().unwrap().supported_encoding;
+        vp8 = vp8 && enc.vp8;
+        av1 = av1 && enc.av1;
+        h264 = h264 && enc.h264;
+        h265 = h265 && enc.h265;
+        (vp8, av1, h264, h265)
     }
 
     pub fn change_prefer_codec(&self) {
-        let msg = self.lc.write().unwrap().change_prefer_codec();
+        let msg = self.lc.write().unwrap().update_supported_decodings();
         self.send(Data::Message(msg));
+    }
+
+    pub fn use_texture_render_changed(&self) {
+        self.send(Data::ResetDecoder(None));
+        self.change_prefer_codec();
+        self.send(Data::Message(LoginConfigHandler::refresh()));
     }
 
     pub fn restart_remote_device(&self) {
@@ -166,27 +488,38 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Message(msg));
     }
 
-    pub fn get_audit_server(&self) -> String {
-        if self.lc.read().unwrap().conn_id <= 0
-            || LocalConfig::get_option("access_token").is_empty()
-        {
+    #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn send_plugin_request(&self, request: PluginRequest) {
+        let mut misc = Misc::new();
+        misc.set_plugin_request(request);
+        let mut msg_out = Message::new();
+        msg_out.set_misc(misc);
+        self.send(Data::Message(msg_out));
+    }
+
+    pub fn get_audit_server(&self, typ: String) -> String {
+        if LocalConfig::get_option("access_token").is_empty() {
             return "".to_owned();
         }
         crate::get_audit_server(
             Config::get_option("api-server"),
             Config::get_option("custom-rendezvous-server"),
+            typ,
         )
     }
 
     pub fn send_note(&self, note: String) {
-        let url = self.get_audit_server();
-        let id = self.id.clone();
-        let conn_id = self.lc.read().unwrap().conn_id;
+        let url = self.get_audit_server("conn".to_string());
+        let id = self.get_id();
+        let session_id = self.lc.read().unwrap().session_id;
         std::thread::spawn(move || {
-            send_note(url, id, conn_id, note);
+            send_note(url, id, session_id, note);
         });
     }
 
+    #[cfg(not(feature = "flutter"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn is_xfce(&self) -> bool {
         crate::platform::is_xfce()
     }
@@ -202,7 +535,7 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::RemovePortForward(port));
     }
 
-    pub fn add_port_forward(&mut self, port: i32, remote_host: String, remote_port: i32) {
+    pub fn add_port_forward(&self, port: i32, remote_host: String, remote_port: i32) {
         let mut config = self.load_config();
         if config
             .port_forwards
@@ -217,10 +550,6 @@ impl<T: InvokeUiSession> Session<T> {
         config.port_forwards.push(pf.clone());
         self.save_config(config);
         self.send(Data::AddPortForward(pf));
-    }
-
-    pub fn get_id(&self) -> String {
-        self.id.clone()
     }
 
     pub fn get_option(&self, k: String) -> String {
@@ -240,7 +569,7 @@ impl<T: InvokeUiSession> Session<T> {
 
     #[inline]
     pub fn load_config(&self) -> PeerConfig {
-        load_config(&self.id)
+        self.lc.read().unwrap().load_config()
     }
 
     #[inline]
@@ -257,436 +586,6 @@ impl<T: InvokeUiSession> Session<T> {
         self.lc.read().unwrap().info.platform.clone()
     }
 
-    pub fn ctrl_alt_del(&self) {
-        if self.peer_platform() == "Windows" {
-            let mut key_event = KeyEvent::new();
-            key_event.set_control_key(ControlKey::CtrlAltDel);
-            // todo
-            key_event.down = true;
-            self.send_key_event(key_event, KeyboardMode::Legacy);
-        } else {
-            let mut key_event = KeyEvent::new();
-            key_event.set_control_key(ControlKey::Delete);
-            self.legacy_modifiers(&mut key_event, true, true, false, false);
-            // todo
-            key_event.press = true;
-            self.send_key_event(key_event, KeyboardMode::Legacy);
-        }
-    }
-
-    fn send_key_event(&self, mut evt: KeyEvent, keyboard_mode: KeyboardMode) {
-        // mode: legacy(0), map(1), translate(2), auto(3)
-        evt.mode = keyboard_mode.into();
-        let mut msg_out = Message::new();
-        msg_out.set_key_event(evt);
-        self.send(Data::Message(msg_out));
-    }
-
-    #[allow(dead_code)]
-    fn convert_numpad_keys(&self, key: RdevKey) -> RdevKey {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if get_key_state(enigo::Key::NumLock) {
-            return key;
-        }
-        match key {
-            RdevKey::Kp0 => RdevKey::Insert,
-            RdevKey::KpDecimal => RdevKey::Delete,
-            RdevKey::Kp1 => RdevKey::End,
-            RdevKey::Kp2 => RdevKey::DownArrow,
-            RdevKey::Kp3 => RdevKey::PageDown,
-            RdevKey::Kp4 => RdevKey::LeftArrow,
-            RdevKey::Kp5 => RdevKey::Clear,
-            RdevKey::Kp6 => RdevKey::RightArrow,
-            RdevKey::Kp7 => RdevKey::Home,
-            RdevKey::Kp8 => RdevKey::UpArrow,
-            RdevKey::Kp9 => RdevKey::PageUp,
-            _ => key,
-        }
-    }
-
-    fn map_keyboard_mode(&self, down_or_up: bool, key: RdevKey, _evt: Option<Event>) {
-        // map mode(1): Send keycode according to the peer platform.
-        #[cfg(target_os = "windows")]
-        let key = if let Some(e) = _evt {
-            rdev::get_win_key(e.code.into(), e.scan_code)
-        } else {
-            key
-        };
-
-        let peer = self.peer_platform();
-        let mut key_event = KeyEvent::new();
-        // According to peer platform.
-        let keycode: u32 = if peer == "Linux" {
-            rdev::linux_keycode_from_key(key).unwrap_or_default().into()
-        } else if peer == "Windows" {
-            rdev::win_keycode_from_key(key).unwrap_or_default().into()
-        } else {
-            // Without Clear Key on Mac OS
-            if key == rdev::Key::Clear {
-                return;
-            }
-            rdev::macos_keycode_from_key(key).unwrap_or_default().into()
-        };
-
-        key_event.set_chr(keycode);
-        key_event.down = down_or_up;
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if get_key_state(enigo::Key::CapsLock) {
-            key_event.modifiers.push(ControlKey::CapsLock.into());
-        }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if get_key_state(enigo::Key::NumLock) {
-            key_event.modifiers.push(ControlKey::NumLock.into());
-        }
-
-        self.send_key_event(key_event, KeyboardMode::Map);
-    }
-
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    fn translate_keyboard_mode(&self, down_or_up: bool, key: RdevKey, evt: Event) {
-        // translate mode(2): locally generated characters are send to the peer.
-
-        // get char
-        let string = match KEYBOARD.lock() {
-            Ok(mut keyboard) => {
-                let string = keyboard.add(&evt.event_type).unwrap_or_default();
-                if keyboard.is_dead() && string == "" && down_or_up == true {
-                    return;
-                }
-                string
-            }
-            Err(_) => "".to_owned(),
-        };
-
-        // maybe two string
-        let chars = if string == "" {
-            None
-        } else {
-            let chars: Vec<char> = string.chars().collect();
-            Some(chars)
-        };
-
-        if let Some(chars) = chars {
-            for chr in chars {
-                let mut key_event = KeyEvent::new();
-                key_event.set_chr(chr as _);
-                key_event.down = true;
-                key_event.press = false;
-
-                self.send_key_event(key_event, KeyboardMode::Translate);
-            }
-        } else {
-            let success = if down_or_up == true {
-                TO_RELEASE.lock().unwrap().insert(key)
-            } else {
-                TO_RELEASE.lock().unwrap().remove(&key)
-            };
-
-            // AltGr && LeftControl(SpecialKey) without action
-            if key == RdevKey::AltGr || evt.scan_code == 541 {
-                return;
-            }
-            if success {
-                self.map_keyboard_mode(down_or_up, key, None);
-            }
-        }
-    }
-
-    fn legacy_modifiers(
-        &self,
-        key_event: &mut KeyEvent,
-        alt: bool,
-        ctrl: bool,
-        shift: bool,
-        command: bool,
-    ) {
-        if alt
-            && !crate::is_control_key(&key_event, &ControlKey::Alt)
-            && !crate::is_control_key(&key_event, &ControlKey::RAlt)
-        {
-            key_event.modifiers.push(ControlKey::Alt.into());
-        }
-        if shift
-            && !crate::is_control_key(&key_event, &ControlKey::Shift)
-            && !crate::is_control_key(&key_event, &ControlKey::RShift)
-        {
-            key_event.modifiers.push(ControlKey::Shift.into());
-        }
-        if ctrl
-            && !crate::is_control_key(&key_event, &ControlKey::Control)
-            && !crate::is_control_key(&key_event, &ControlKey::RControl)
-        {
-            key_event.modifiers.push(ControlKey::Control.into());
-        }
-        if command
-            && !crate::is_control_key(&key_event, &ControlKey::Meta)
-            && !crate::is_control_key(&key_event, &ControlKey::RWin)
-        {
-            key_event.modifiers.push(ControlKey::Meta.into());
-        }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if get_key_state(enigo::Key::CapsLock) {
-            key_event.modifiers.push(ControlKey::CapsLock.into());
-        }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if self.peer_platform() != "Mac OS" {
-            if get_key_state(enigo::Key::NumLock) {
-                key_event.modifiers.push(ControlKey::NumLock.into());
-            }
-        }
-    }
-
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    fn legacy_keyboard_mode(&self, down_or_up: bool, key: RdevKey, evt: Event) {
-        // legacy mode(0): Generate characters locally, look for keycode on other side.
-        let peer = self.peer_platform();
-        let is_win = peer == "Windows";
-
-        let alt = get_key_state(enigo::Key::Alt);
-        #[cfg(windows)]
-        let ctrl = {
-            let mut tmp =
-                get_key_state(enigo::Key::Control) || get_key_state(enigo::Key::RightControl);
-            unsafe {
-                if IS_ALT_GR {
-                    if alt || key == RdevKey::AltGr {
-                        if tmp {
-                            tmp = false;
-                        }
-                    } else {
-                        IS_ALT_GR = false;
-                    }
-                }
-            }
-            tmp
-        };
-        #[cfg(not(windows))]
-        let ctrl = get_key_state(enigo::Key::Control) || get_key_state(enigo::Key::RightControl);
-        let shift = get_key_state(enigo::Key::Shift) || get_key_state(enigo::Key::RightShift);
-        #[cfg(windows)]
-        let command = crate::platform::windows::get_win_key_state();
-        #[cfg(not(windows))]
-        let command = get_key_state(enigo::Key::Meta);
-        let control_key = match key {
-            RdevKey::Alt => Some(ControlKey::Alt),
-            RdevKey::AltGr => Some(ControlKey::RAlt),
-            RdevKey::Backspace => Some(ControlKey::Backspace),
-            RdevKey::ControlLeft => {
-                // when pressing AltGr, an extra VK_LCONTROL with a special
-                // scancode with bit 9 set is sent, let's ignore this.
-                #[cfg(windows)]
-                if evt.scan_code & 0x200 != 0 {
-                    unsafe {
-                        IS_ALT_GR = true;
-                    }
-                    return;
-                }
-                Some(ControlKey::Control)
-            }
-            RdevKey::ControlRight => Some(ControlKey::RControl),
-            RdevKey::DownArrow => Some(ControlKey::DownArrow),
-            RdevKey::Escape => Some(ControlKey::Escape),
-            RdevKey::F1 => Some(ControlKey::F1),
-            RdevKey::F10 => Some(ControlKey::F10),
-            RdevKey::F11 => Some(ControlKey::F11),
-            RdevKey::F12 => Some(ControlKey::F12),
-            RdevKey::F2 => Some(ControlKey::F2),
-            RdevKey::F3 => Some(ControlKey::F3),
-            RdevKey::F4 => Some(ControlKey::F4),
-            RdevKey::F5 => Some(ControlKey::F5),
-            RdevKey::F6 => Some(ControlKey::F6),
-            RdevKey::F7 => Some(ControlKey::F7),
-            RdevKey::F8 => Some(ControlKey::F8),
-            RdevKey::F9 => Some(ControlKey::F9),
-            RdevKey::LeftArrow => Some(ControlKey::LeftArrow),
-            RdevKey::MetaLeft => Some(ControlKey::Meta),
-            RdevKey::MetaRight => Some(ControlKey::RWin),
-            RdevKey::Return => Some(ControlKey::Return),
-            RdevKey::RightArrow => Some(ControlKey::RightArrow),
-            RdevKey::ShiftLeft => Some(ControlKey::Shift),
-            RdevKey::ShiftRight => Some(ControlKey::RShift),
-            RdevKey::Space => Some(ControlKey::Space),
-            RdevKey::Tab => Some(ControlKey::Tab),
-            RdevKey::UpArrow => Some(ControlKey::UpArrow),
-            RdevKey::Delete => {
-                if is_win && ctrl && alt {
-                    self.ctrl_alt_del();
-                    return;
-                }
-                Some(ControlKey::Delete)
-            }
-            RdevKey::Apps => Some(ControlKey::Apps),
-            RdevKey::Cancel => Some(ControlKey::Cancel),
-            RdevKey::Clear => Some(ControlKey::Clear),
-            RdevKey::Kana => Some(ControlKey::Kana),
-            RdevKey::Hangul => Some(ControlKey::Hangul),
-            RdevKey::Junja => Some(ControlKey::Junja),
-            RdevKey::Final => Some(ControlKey::Final),
-            RdevKey::Hanja => Some(ControlKey::Hanja),
-            RdevKey::Hanji => Some(ControlKey::Hanja),
-            RdevKey::Convert => Some(ControlKey::Convert),
-            RdevKey::Print => Some(ControlKey::Print),
-            RdevKey::Select => Some(ControlKey::Select),
-            RdevKey::Execute => Some(ControlKey::Execute),
-            RdevKey::PrintScreen => Some(ControlKey::Snapshot),
-            RdevKey::Help => Some(ControlKey::Help),
-            RdevKey::Sleep => Some(ControlKey::Sleep),
-            RdevKey::Separator => Some(ControlKey::Separator),
-            RdevKey::KpReturn => Some(ControlKey::NumpadEnter),
-            RdevKey::Kp0 => Some(ControlKey::Numpad0),
-            RdevKey::Kp1 => Some(ControlKey::Numpad1),
-            RdevKey::Kp2 => Some(ControlKey::Numpad2),
-            RdevKey::Kp3 => Some(ControlKey::Numpad3),
-            RdevKey::Kp4 => Some(ControlKey::Numpad4),
-            RdevKey::Kp5 => Some(ControlKey::Numpad5),
-            RdevKey::Kp6 => Some(ControlKey::Numpad6),
-            RdevKey::Kp7 => Some(ControlKey::Numpad7),
-            RdevKey::Kp8 => Some(ControlKey::Numpad8),
-            RdevKey::Kp9 => Some(ControlKey::Numpad9),
-            RdevKey::KpDivide => Some(ControlKey::Divide),
-            RdevKey::KpMultiply => Some(ControlKey::Multiply),
-            RdevKey::KpDecimal => Some(ControlKey::Decimal),
-            RdevKey::KpMinus => Some(ControlKey::Subtract),
-            RdevKey::KpPlus => Some(ControlKey::Add),
-            RdevKey::CapsLock | RdevKey::NumLock | RdevKey::ScrollLock => {
-                return;
-            }
-            RdevKey::Home => Some(ControlKey::Home),
-            RdevKey::End => Some(ControlKey::End),
-            RdevKey::Insert => Some(ControlKey::Insert),
-            RdevKey::PageUp => Some(ControlKey::PageUp),
-            RdevKey::PageDown => Some(ControlKey::PageDown),
-            RdevKey::Pause => Some(ControlKey::Pause),
-            _ => None,
-        };
-        let mut key_event = KeyEvent::new();
-        if let Some(k) = control_key {
-            key_event.set_control_key(k);
-        } else {
-            let mut chr = match evt.name {
-                Some(ref s) => {
-                    if s.len() <= 2 {
-                        // exclude chinese characters
-                        s.chars().next().unwrap_or('\0')
-                    } else {
-                        '\0'
-                    }
-                }
-                _ => '\0',
-            };
-            if chr == '·' {
-                // special for Chinese
-                chr = '`';
-            }
-            if chr == '\0' {
-                chr = match key {
-                    RdevKey::Num1 => '1',
-                    RdevKey::Num2 => '2',
-                    RdevKey::Num3 => '3',
-                    RdevKey::Num4 => '4',
-                    RdevKey::Num5 => '5',
-                    RdevKey::Num6 => '6',
-                    RdevKey::Num7 => '7',
-                    RdevKey::Num8 => '8',
-                    RdevKey::Num9 => '9',
-                    RdevKey::Num0 => '0',
-                    RdevKey::KeyA => 'a',
-                    RdevKey::KeyB => 'b',
-                    RdevKey::KeyC => 'c',
-                    RdevKey::KeyD => 'd',
-                    RdevKey::KeyE => 'e',
-                    RdevKey::KeyF => 'f',
-                    RdevKey::KeyG => 'g',
-                    RdevKey::KeyH => 'h',
-                    RdevKey::KeyI => 'i',
-                    RdevKey::KeyJ => 'j',
-                    RdevKey::KeyK => 'k',
-                    RdevKey::KeyL => 'l',
-                    RdevKey::KeyM => 'm',
-                    RdevKey::KeyN => 'n',
-                    RdevKey::KeyO => 'o',
-                    RdevKey::KeyP => 'p',
-                    RdevKey::KeyQ => 'q',
-                    RdevKey::KeyR => 'r',
-                    RdevKey::KeyS => 's',
-                    RdevKey::KeyT => 't',
-                    RdevKey::KeyU => 'u',
-                    RdevKey::KeyV => 'v',
-                    RdevKey::KeyW => 'w',
-                    RdevKey::KeyX => 'x',
-                    RdevKey::KeyY => 'y',
-                    RdevKey::KeyZ => 'z',
-                    RdevKey::Comma => ',',
-                    RdevKey::Dot => '.',
-                    RdevKey::SemiColon => ';',
-                    RdevKey::Quote => '\'',
-                    RdevKey::LeftBracket => '[',
-                    RdevKey::RightBracket => ']',
-                    RdevKey::BackSlash => '\\',
-                    RdevKey::Minus => '-',
-                    RdevKey::Equal => '=',
-                    RdevKey::BackQuote => '`',
-                    _ => '\0',
-                }
-            }
-            if chr != '\0' {
-                if chr == 'l' && is_win && command {
-                    self.lock_screen();
-                    return;
-                }
-                key_event.set_chr(chr as _);
-            } else {
-                log::error!("Unknown key {:?}", evt);
-                return;
-            }
-        }
-
-        self.legacy_modifiers(&mut key_event, alt, ctrl, shift, command);
-
-        if down_or_up == true {
-            key_event.down = true;
-        }
-        self.send_key_event(key_event, KeyboardMode::Legacy)
-    }
-
-    fn key_down_or_up(&self, down_or_up: bool, key: RdevKey, evt: Event) {
-        // Call different functions according to keyboard mode.
-        let mode = match self.get_keyboard_mode().as_str() {
-            "map" => KeyboardMode::Map,
-            "legacy" => KeyboardMode::Legacy,
-            "translate" => KeyboardMode::Translate,
-            _ => KeyboardMode::Legacy,
-        };
-
-        #[cfg(not(windows))]
-        let key = self.convert_numpad_keys(key);
-
-        match mode {
-            KeyboardMode::Map => {
-                if down_or_up == true {
-                    TO_RELEASE.lock().unwrap().insert(key);
-                } else {
-                    TO_RELEASE.lock().unwrap().remove(&key);
-                }
-                self.map_keyboard_mode(down_or_up, key, Some(evt));
-            }
-            KeyboardMode::Legacy =>
-            {
-                #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                self.legacy_keyboard_mode(down_or_up, key, evt)
-            }
-            KeyboardMode::Translate => {
-                #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                self.translate_keyboard_mode(down_or_up, key, evt);
-            }
-            _ =>
-            {
-                #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                self.legacy_keyboard_mode(down_or_up, key, evt)
-            }
-        }
-    }
-
     pub fn get_platform(&self, is_remote: bool) -> String {
         if is_remote {
             self.peer_platform()
@@ -697,7 +596,7 @@ impl<T: InvokeUiSession> Session<T> {
 
     pub fn get_path_sep(&self, is_remote: bool) -> &'static str {
         let p = self.get_platform(is_remote);
-        if &p == "Windows" {
+        if &p == crate::PLATFORM_WINDOWS {
             return "\\";
         } else {
             return "/";
@@ -708,11 +607,97 @@ impl<T: InvokeUiSession> Session<T> {
         input_os_password(pass, activate, self.clone());
     }
 
+    #[cfg(not(feature = "flutter"))]
     pub fn get_chatbox(&self) -> String {
         #[cfg(feature = "inline")]
         return crate::ui::inline::get_chatbox();
         #[cfg(not(feature = "inline"))]
         return "".to_owned();
+    }
+
+    pub fn swap_modifier_key(&self, msg: &mut KeyEvent) {
+        let allow_swap_key = self.get_toggle_option("allow_swap_key".to_string());
+        if allow_swap_key {
+            if let Some(key_event::Union::ControlKey(ck)) = msg.union {
+                let ck = ck.enum_value_or_default();
+                let ck = match ck {
+                    ControlKey::Control => ControlKey::Meta,
+                    ControlKey::Meta => ControlKey::Control,
+                    ControlKey::RControl => ControlKey::Meta,
+                    ControlKey::RWin => ControlKey::Control,
+                    _ => ck,
+                };
+                msg.set_control_key(ck);
+            }
+            msg.modifiers = msg
+                .modifiers
+                .iter()
+                .map(|ck| {
+                    let ck = ck.enum_value_or_default();
+                    let ck = match ck {
+                        ControlKey::Control => ControlKey::Meta,
+                        ControlKey::Meta => ControlKey::Control,
+                        ControlKey::RControl => ControlKey::Meta,
+                        ControlKey::RWin => ControlKey::Control,
+                        _ => ck,
+                    };
+                    hbb_common::protobuf::EnumOrUnknown::new(ck)
+                })
+                .collect();
+
+            let code = msg.chr();
+            if code != 0 {
+                let mut peer = self.peer_platform().to_lowercase();
+                peer.retain(|c| !c.is_whitespace());
+
+                let key = match peer.as_str() {
+                    "windows" => {
+                        let key = rdev::win_key_from_scancode(code);
+                        let key = match key {
+                            rdev::Key::ControlLeft => rdev::Key::MetaLeft,
+                            rdev::Key::MetaLeft => rdev::Key::ControlLeft,
+                            rdev::Key::ControlRight => rdev::Key::MetaLeft,
+                            rdev::Key::MetaRight => rdev::Key::ControlLeft,
+                            _ => key,
+                        };
+                        rdev::win_scancode_from_key(key).unwrap_or_default()
+                    }
+                    "macos" => {
+                        let key = rdev::macos_key_from_code(code as _);
+                        let key = match key {
+                            rdev::Key::ControlLeft => rdev::Key::MetaLeft,
+                            rdev::Key::MetaLeft => rdev::Key::ControlLeft,
+                            rdev::Key::ControlRight => rdev::Key::MetaLeft,
+                            rdev::Key::MetaRight => rdev::Key::ControlLeft,
+                            _ => key,
+                        };
+                        rdev::macos_keycode_from_key(key).unwrap_or_default() as _
+                    }
+                    _ => {
+                        let key = rdev::linux_key_from_code(code);
+                        let key = match key {
+                            rdev::Key::ControlLeft => rdev::Key::MetaLeft,
+                            rdev::Key::MetaLeft => rdev::Key::ControlLeft,
+                            rdev::Key::ControlRight => rdev::Key::MetaLeft,
+                            rdev::Key::MetaRight => rdev::Key::ControlLeft,
+                            _ => key,
+                        };
+                        rdev::linux_keycode_from_key(key).unwrap_or_default()
+                    }
+                };
+                msg.set_chr(key);
+            }
+        }
+    }
+
+    pub fn send_key_event(&self, evt: &KeyEvent) {
+        // mode: legacy(0), map(1), translate(2), auto(3)
+
+        let mut msg = evt.clone();
+        self.swap_modifier_key(&mut msg);
+        let mut msg_out = Message::new();
+        msg_out.set_key_event(msg);
+        self.send(Data::Message(msg_out));
     }
 
     pub fn send_chat(&self, text: String) {
@@ -726,10 +711,12 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Message(msg_out));
     }
 
-    pub fn switch_display(&self, display: i32) {
+    pub fn capture_displays(&self, add: Vec<i32>, sub: Vec<i32>, set: Vec<i32>) {
         let mut misc = Misc::new();
-        misc.set_switch_display(SwitchDisplay {
-            display,
+        misc.set_capture_displays(CaptureDisplays {
+            add,
+            sub,
+            set,
             ..Default::default()
         });
         let mut msg_out = Message::new();
@@ -737,61 +724,36 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Message(msg_out));
     }
 
-    pub fn lock_screen(&self) {
-        let mut key_event = KeyEvent::new();
-        key_event.set_control_key(ControlKey::LockScreen);
-        // todo
-        key_event.down = true;
-        self.send_key_event(key_event, KeyboardMode::Legacy);
-    }
-
-    pub fn enter(&self) {
-        #[cfg(windows)]
-        crate::platform::windows::stop_system_key_propagate(true);
-        IS_IN.store(true, Ordering::SeqCst);
-    }
-
-    pub fn leave(&self) {
-        for key in TO_RELEASE.lock().unwrap().iter() {
-            self.map_keyboard_mode(false, *key, None)
-        }
-        #[cfg(windows)]
-        crate::platform::windows::stop_system_key_propagate(false);
-        IS_IN.store(false, Ordering::SeqCst);
-    }
-
-    pub fn handle_flutter_key_event(
-        &self,
-        name: &str,
-        keycode: i32,
-        scancode: i32,
-        down_or_up: bool,
-    ) {
-        if scancode < 0 || keycode < 0 {
-            return;
-        }
-        let keycode: u32 = keycode as u32;
-        let scancode: u32 = scancode as u32;
-
-        let key = rdev::key_from_scancode(scancode) as RdevKey;
-        // Windows requires special handling
-        #[cfg(target_os = "windows")]
-        let key = rdev::get_win_key(keycode, scancode);
-
-        let event_type = if down_or_up {
-            KeyPress(key)
-        } else {
-            KeyRelease(key)
-        };
-        let evt = Event {
-            time: std::time::SystemTime::now(),
-            name: Option::Some(name.to_owned()),
-            code: keycode as _,
-            scan_code: scancode as _,
-            event_type: event_type,
+    pub fn switch_display(&self, display: i32) {
+        let (w, h) = match self.lc.read().unwrap().get_custom_resolution(display) {
+            Some((w, h)) => (w, h),
+            None => (0, 0),
         };
 
-        self.key_down_or_up(down_or_up, key, evt)
+        let mut misc = Misc::new();
+        misc.set_switch_display(SwitchDisplay {
+            display,
+            width: w,
+            height: h,
+            ..Default::default()
+        });
+        let mut msg_out = Message::new();
+        msg_out.set_misc(misc);
+        self.send(Data::Message(msg_out));
+
+        if !use_texture_render() {
+            self.capture_displays(vec![], vec![], vec![display]);
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn enter(&self, keyboard_mode: String) {
+        keyboard::client::change_grab_status(GrabState::Run, &keyboard_mode);
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn leave(&self, keyboard_mode: String) {
+        keyboard::client::change_grab_status(GrabState::Wait, &keyboard_mode);
     }
 
     // flutter only TODO new input
@@ -816,13 +778,197 @@ impl<T: InvokeUiSession> Session<T> {
         }
     }
 
-    // flutter only TODO new input
     pub fn input_string(&self, value: &str) {
         let mut key_event = KeyEvent::new();
         key_event.set_seq(value.to_owned());
         let mut msg_out = Message::new();
         msg_out.set_key_event(key_event);
         self.send(Data::Message(msg_out));
+    }
+
+    #[cfg(any(target_os = "ios"))]
+    pub fn handle_flutter_raw_key_event(
+        &self,
+        _keyboard_mode: &str,
+        _name: &str,
+        _platform_code: i32,
+        _position_code: i32,
+        _lock_modes: i32,
+        _down_or_up: bool,
+    ) {
+    }
+
+    #[cfg(not(any(target_os = "ios")))]
+    pub fn handle_flutter_raw_key_event(
+        &self,
+        keyboard_mode: &str,
+        name: &str,
+        platform_code: i32,
+        position_code: i32,
+        lock_modes: i32,
+        down_or_up: bool,
+    ) {
+        if name == "flutter_key" {
+            self._handle_key_flutter_simulation(keyboard_mode, platform_code, down_or_up);
+        } else {
+            self._handle_raw_key_non_flutter_simulation(
+                keyboard_mode,
+                platform_code,
+                position_code,
+                lock_modes,
+                down_or_up,
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "ios")))]
+    fn _handle_raw_key_non_flutter_simulation(
+        &self,
+        keyboard_mode: &str,
+        platform_code: i32,
+        position_code: i32,
+        lock_modes: i32,
+        down_or_up: bool,
+    ) {
+        if position_code < 0 || platform_code < 0 {
+            return;
+        }
+        let platform_code: u32 = platform_code as _;
+        let position_code: KeyCode = position_code as _;
+
+        #[cfg(not(target_os = "windows"))]
+        let key = rdev::key_from_code(position_code) as rdev::Key;
+        // Windows requires special handling
+        #[cfg(target_os = "windows")]
+        let key = rdev::get_win_key(platform_code, position_code);
+
+        let event_type = if down_or_up {
+            KeyPress(key)
+        } else {
+            KeyRelease(key)
+        };
+        let event = Event {
+            time: SystemTime::now(),
+            unicode: None,
+            platform_code,
+            position_code: position_code as _,
+            event_type,
+            usb_hid: 0,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            extra_data: 0,
+        };
+        keyboard::client::process_event_with_session(keyboard_mode, &event, Some(lock_modes), self);
+    }
+
+    pub fn handle_flutter_key_event(
+        &self,
+        keyboard_mode: &str,
+        character: &str,
+        usb_hid: i32,
+        lock_modes: i32,
+        down_or_up: bool,
+    ) {
+        if character == "flutter_key" {
+            self._handle_key_flutter_simulation(keyboard_mode, usb_hid, down_or_up);
+        } else {
+            self._handle_key_non_flutter_simulation(
+                keyboard_mode,
+                character,
+                usb_hid,
+                lock_modes,
+                down_or_up,
+            );
+        }
+    }
+
+    fn _handle_key_flutter_simulation(
+        &self,
+        _keyboard_mode: &str,
+        platform_code: i32,
+        down_or_up: bool,
+    ) {
+        // https://github.com/flutter/flutter/blob/master/packages/flutter/lib/src/services/keyboard_key.g.dart#L4356
+        let ctrl_key = match platform_code {
+            0x007f => Some(ControlKey::VolumeMute),
+            0x0080 => Some(ControlKey::VolumeUp),
+            0x0081 => Some(ControlKey::VolumeDown),
+            0x0066 => Some(ControlKey::Power),
+            _ => None,
+        };
+        let Some(ctrl_key) = ctrl_key else { return };
+        let mut key_event = KeyEvent {
+            mode: KeyboardMode::Translate.into(),
+            down: down_or_up,
+            ..Default::default()
+        };
+        key_event.set_control_key(ctrl_key);
+        self.send_key_event(&key_event);
+    }
+
+    fn _handle_key_non_flutter_simulation(
+        &self,
+        keyboard_mode: &str,
+        character: &str,
+        usb_hid: i32,
+        lock_modes: i32,
+        down_or_up: bool,
+    ) {
+        let key = rdev::usb_hid_key_from_code(usb_hid as _);
+
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let position_code: KeyCode = 0;
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let platform_code: KeyCode = 0;
+
+        #[cfg(target_os = "windows")]
+        let platform_code: u32 = rdev::win_code_from_key(key).unwrap_or(0);
+        #[cfg(target_os = "windows")]
+        let position_code: KeyCode = rdev::win_scancode_from_key(key).unwrap_or(0) as _;
+
+        #[cfg(not(any(target_os = "windows", target_os = "android", target_os = "ios")))]
+        let position_code: KeyCode = rdev::code_from_key(key).unwrap_or(0) as _;
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux"
+        )))]
+        let platform_code: u32 = position_code as _;
+        // For translate mode.
+        // We need to set the platform code (keysym) if is AltGr.
+        // https://github.com/rustdesk/rustdesk/blob/07cf1b4db5ef2f925efd3b16b87c33ce03c94809/src/keyboard.rs#L1029
+        // https://github.com/flutter/flutter/issues/153811
+        #[cfg(target_os = "linux")]
+        let platform_code: u32 = position_code as _;
+
+        let event_type = if down_or_up {
+            KeyPress(key)
+        } else {
+            KeyRelease(key)
+        };
+        let event = Event {
+            time: SystemTime::now(),
+            unicode: if character.is_empty() {
+                None
+            } else {
+                Some(rdev::UnicodeInfo {
+                    name: Some(character.to_string()),
+                    unicode: character.encode_utf16().collect(),
+                    // is_dead: is not correct here, because flutter cannot detect deadcode for now.
+                    is_dead: false,
+                })
+            },
+            platform_code,
+            position_code: position_code as _,
+            event_type,
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            usb_hid: usb_hid as _,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            usb_hid: 0,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            extra_data: 0,
+        };
+        keyboard::client::process_event_with_session(keyboard_mode, &event, Some(lock_modes), self);
     }
 
     // flutter only TODO new input
@@ -849,56 +995,98 @@ impl<T: InvokeUiSession> Session<T> {
                 key_event.set_chr(chr);
             }
             Key::ControlKey(key) => {
-                #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                let key = if !get_key_state(enigo::Key::NumLock) {
-                    match key {
-                        ControlKey::Numpad0 => ControlKey::Insert,
-                        ControlKey::Decimal => ControlKey::Delete,
-                        ControlKey::Numpad1 => ControlKey::End,
-                        ControlKey::Numpad2 => ControlKey::DownArrow,
-                        ControlKey::Numpad3 => ControlKey::PageDown,
-                        ControlKey::Numpad4 => ControlKey::LeftArrow,
-                        ControlKey::Numpad5 => ControlKey::Clear,
-                        ControlKey::Numpad6 => ControlKey::RightArrow,
-                        ControlKey::Numpad7 => ControlKey::Home,
-                        ControlKey::Numpad8 => ControlKey::UpArrow,
-                        ControlKey::Numpad9 => ControlKey::PageUp,
-                        _ => key,
-                    }
-                }else{
-                    key
-                };
                 key_event.set_control_key(key.clone());
             }
             Key::_Raw(raw) => {
-                if raw > 'z' as u32 || raw < 'a' as u32 {
-                    key_event.set_unicode(raw);
-                    // TODO
-                    // if down_or_up == 0 {
-                    //     // ignore up, avoiding trigger twice
-                    //     return;
-                    // }
-                    // down_or_up = 1; // if press, turn into down for avoiding trigger twice on server side
-                } else {
-                    // to make ctrl+c works on windows
-                    key_event.set_chr(raw);
-                }
+                key_event.set_chr(raw);
             }
         }
 
-        self.legacy_modifiers(&mut key_event, alt, ctrl, shift, command);
         if v == 1 {
             key_event.down = true;
         } else if v == 3 {
             key_event.press = true;
         }
+        keyboard::client::legacy_modifiers(&mut key_event, alt, ctrl, shift, command);
+        key_event.mode = KeyboardMode::Legacy.into();
 
-        self.send_key_event(key_event, KeyboardMode::Legacy);
+        self.send_key_event(&key_event);
+    }
+
+    pub fn send_touch_scale(&self, scale: i32, alt: bool, ctrl: bool, shift: bool, command: bool) {
+        let scale_evt = TouchScaleUpdate {
+            scale,
+            ..Default::default()
+        };
+        let mut touch_evt = TouchEvent::new();
+        touch_evt.set_scale_update(scale_evt);
+        let mut evt = PointerDeviceEvent::new();
+        evt.set_touch_event(touch_evt);
+        send_pointer_device_event(evt, alt, ctrl, shift, command, self);
+    }
+
+    pub fn send_touch_pan_event(
+        &self,
+        event: &str,
+        x: i32,
+        y: i32,
+        alt: bool,
+        ctrl: bool,
+        shift: bool,
+        command: bool,
+    ) {
+        let mut touch_evt = TouchEvent::new();
+        match event {
+            "pan_start" => {
+                touch_evt.set_pan_start(TouchPanStart {
+                    x,
+                    y,
+                    ..Default::default()
+                });
+            }
+            "pan_update" => {
+                let (x, y) = self.get_scroll_xy((x, y));
+                touch_evt.set_pan_update(TouchPanUpdate {
+                    x,
+                    y,
+                    ..Default::default()
+                });
+            }
+            "pan_end" => {
+                touch_evt.set_pan_end(TouchPanEnd {
+                    x,
+                    y,
+                    ..Default::default()
+                });
+            }
+            _ => {
+                log::warn!("unknown touch pan event: {}", event);
+                return;
+            }
+        };
+        let mut evt = PointerDeviceEvent::new();
+        evt.set_touch_event(touch_evt);
+        send_pointer_device_event(evt, alt, ctrl, shift, command, self);
+    }
+
+    #[inline]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn is_scroll_reverse_mode(&self) -> bool {
+        self.lc.read().unwrap().reverse_mouse_wheel.eq("Y")
+    }
+
+    #[inline]
+    fn get_scroll_xy(&self, xy: (i32, i32)) -> (i32, i32) {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if self.is_scroll_reverse_mode() {
+            return (-xy.0, -xy.1);
+        }
+        xy
     }
 
     pub fn send_mouse(
         &self,
-        mask: i32,
+        mut mask: i32,
         x: i32,
         y: i32,
         alt: bool,
@@ -915,6 +1103,30 @@ impl<T: InvokeUiSession> Session<T> {
             }
         }
 
+        let (x, y) = if mask == MOUSE_TYPE_WHEEL || mask == MOUSE_TYPE_TRACKPAD {
+            self.get_scroll_xy((x, y))
+        } else {
+            (x, y)
+        };
+
+        // #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let (alt, ctrl, shift, command) =
+            keyboard::client::get_modifiers_state(alt, ctrl, shift, command);
+
+        use crate::input::*;
+        let is_left = (mask & (MOUSE_BUTTON_LEFT << 3)) > 0;
+        let is_right = (mask & (MOUSE_BUTTON_RIGHT << 3)) > 0;
+        if is_left ^ is_right {
+            let swap_lr = self.get_toggle_option("swap-left-right-mouse".to_string());
+            if swap_lr {
+                if is_left {
+                    mask = (mask & (!(MOUSE_BUTTON_LEFT << 3))) | (MOUSE_BUTTON_RIGHT << 3);
+                } else {
+                    mask = (mask & (!(MOUSE_BUTTON_RIGHT << 3))) | (MOUSE_BUTTON_LEFT << 3);
+                }
+            }
+        }
+
         send_mouse(mask, x, y, alt, ctrl, shift, command, self);
         // on macos, ctrl + left button down = right button down, up won't emit, so we need to
         // emit up myself if peer is not macos
@@ -922,22 +1134,54 @@ impl<T: InvokeUiSession> Session<T> {
         if cfg!(target_os = "macos") {
             let buttons = mask >> 3;
             let evt_type = mask & 0x7;
-            if buttons == 1 && evt_type == 1 && ctrl && self.peer_platform() != "Mac OS" {
-                self.send_mouse((1 << 3 | 2) as _, x, y, alt, ctrl, shift, command);
+            if buttons == MOUSE_BUTTON_LEFT
+                && evt_type == MOUSE_TYPE_DOWN
+                && ctrl
+                && self.peer_platform() != "Mac OS"
+            {
+                self.send_mouse(
+                    (MOUSE_BUTTON_LEFT << 3 | MOUSE_TYPE_UP) as _,
+                    x,
+                    y,
+                    alt,
+                    ctrl,
+                    shift,
+                    command,
+                );
             }
         }
     }
 
-    pub fn reconnect(&self) {
-        self.send(Data::Close);
+    pub fn reconnect(&self, force_relay: bool) {
+        // 1. If current session is connecting, do not reconnect.
+        // 2. If the connection is established, send `Data::Close`.
+        // 3. If the connection is disconnected, do nothing.
+        let mut connection_round_state_lock = self.connection_round_state.lock().unwrap();
+        if self.thread.lock().unwrap().is_some() {
+            match connection_round_state_lock.state {
+                ConnectionState::Connecting => return,
+                ConnectionState::Connected => self.send(Data::Close),
+                ConnectionState::Disconnected => {}
+            }
+        }
+        let round = connection_round_state_lock.new_round();
+        drop(connection_round_state_lock);
+
         let cloned = self.clone();
+        // override only if true
+        if true == force_relay {
+            self.lc.write().unwrap().force_relay = true;
+        }
+        self.lc.write().unwrap().peer_info = None;
         let mut lock = self.thread.lock().unwrap();
-        lock.take().map(|t| t.join());
+        // No need to join the previous thread, because it will exit automatically.
+        // And the previous thread will not change important states.
         *lock = Some(std::thread::spawn(move || {
-            io_loop(cloned);
+            io_loop(cloned, round);
         }));
     }
 
+    #[cfg(not(feature = "flutter"))]
     pub fn get_icon_path(&self, file_type: i32, ext: String) -> String {
         let mut path = Config::icon_path();
         if file_type == FileType::DirLink as i32 {
@@ -988,8 +1232,37 @@ impl<T: InvokeUiSession> Session<T> {
         fs::get_string(&path)
     }
 
-    pub fn login(&self, password: String, remember: bool) {
-        self.send(Data::Login((password, remember)));
+    pub fn login(
+        &self,
+        os_username: String,
+        os_password: String,
+        password: String,
+        remember: bool,
+    ) {
+        self.send(Data::Login((os_username, os_password, password, remember)));
+    }
+
+    pub fn send2fa(&self, code: String, trust_this_device: bool) {
+        let mut msg_out = Message::new();
+        let hwid = if trust_this_device {
+            crate::get_hwid()
+        } else {
+            Bytes::new()
+        };
+        self.lc.write().unwrap().set_option(
+            "trust-this-device".to_string(),
+            if trust_this_device { "Y" } else { "" }.to_string(),
+        );
+        msg_out.set_auth_2fa(Auth2FA {
+            code,
+            hwid,
+            ..Default::default()
+        });
+        self.send(Data::Message(msg_out));
+    }
+
+    pub fn get_enable_trusted_devices(&self) -> bool {
+        self.lc.read().unwrap().enable_trusted_devices
     }
 
     pub fn new_rdp(&self) {
@@ -1025,20 +1298,212 @@ impl<T: InvokeUiSession> Session<T> {
         }
         self.update_transfer_list();
     }
+
+    pub fn elevate_direct(&self) {
+        self.send(Data::ElevateDirect);
+    }
+
+    pub fn elevate_with_logon(&self, username: String, password: String) {
+        self.send(Data::ElevateWithLogon(username, password));
+    }
+
+    #[cfg(any(target_os = "ios"))]
+    pub fn switch_sides(&self) {}
+
+    #[cfg(not(any(target_os = "ios")))]
+    #[tokio::main(flavor = "current_thread")]
+    pub async fn switch_sides(&self) {
+        match crate::ipc::connect(1000, "").await {
+            Ok(mut conn) => {
+                if conn
+                    .send(&crate::ipc::Data::SwitchSidesRequest(self.get_id()))
+                    .await
+                    .is_ok()
+                {
+                    if let Ok(Some(data)) = conn.next_timeout(1000).await {
+                        match data {
+                            crate::ipc::Data::SwitchSidesRequest(str_uuid) => {
+                                if let Ok(uuid) = Uuid::from_str(&str_uuid) {
+                                    let mut misc = Misc::new();
+                                    misc.set_switch_sides_request(SwitchSidesRequest {
+                                        uuid: Bytes::from(uuid.as_bytes().to_vec()),
+                                        ..Default::default()
+                                    });
+                                    let mut msg_out = Message::new();
+                                    msg_out.set_misc(misc);
+                                    self.send(Data::Message(msg_out));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                log::info!("server not started (will try to start): {}", err);
+            }
+        }
+    }
+
+    fn set_custom_resolution(&self, display: &SwitchDisplay) {
+        if display.width == display.original_resolution.width
+            && display.height == display.original_resolution.height
+        {
+            self.lc
+                .write()
+                .unwrap()
+                .set_custom_resolution(display.display, None);
+        } else {
+            let last_change_display = self.last_change_display.lock().unwrap();
+            if last_change_display.display == display.display {
+                let wh = if last_change_display.is_the_same_record(
+                    display.display,
+                    display.width,
+                    display.height,
+                ) {
+                    Some((display.width, display.height))
+                } else {
+                    // display origin is changed, or some other events.
+                    None
+                };
+                self.lc
+                    .write()
+                    .unwrap()
+                    .set_custom_resolution(display.display, wh);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn handle_peer_switch_display(&self, display: &SwitchDisplay) {
+        self.ui_handler.switch_display(display);
+        self.set_custom_resolution(display);
+    }
+
+    #[inline]
+    pub fn change_resolution(&self, display: i32, width: i32, height: i32) {
+        *self.last_change_display.lock().unwrap() =
+            ChangeDisplayRecord::new(display, width, height);
+        self.do_change_resolution(display, width, height);
+    }
+
+    #[inline]
+    fn try_change_init_resolution(&self, display: i32) {
+        if let Some((w, h)) = self.lc.read().unwrap().get_custom_resolution(display) {
+            self.change_resolution(display, w, h);
+        }
+    }
+
+    fn do_change_resolution(&self, display: i32, width: i32, height: i32) {
+        let mut misc = Misc::new();
+        let resolution = Resolution {
+            width,
+            height,
+            ..Default::default()
+        };
+        if crate::common::is_support_multi_ui_session_num(self.lc.read().unwrap().version) {
+            misc.set_change_display_resolution(DisplayResolution {
+                display,
+                resolution: Some(resolution).into(),
+                ..Default::default()
+            });
+        } else {
+            misc.set_change_resolution(resolution);
+        }
+        let mut msg = Message::new();
+        msg.set_misc(misc);
+        self.send(Data::Message(msg));
+    }
+
+    #[inline]
+    pub fn request_voice_call(&self) {
+        #[cfg(target_os = "linux")]
+        std::thread::spawn(crate::ipc::start_pa);
+        self.send(Data::NewVoiceCall);
+    }
+
+    #[inline]
+    pub fn close_voice_call(&self) {
+        self.send(Data::CloseVoiceCall);
+    }
+
+    pub fn send_selected_session_id(&self, sid: String) {
+        if let Ok(sid) = sid.parse::<u32>() {
+            self.lc.write().unwrap().selected_windows_session_id = Some(sid);
+            let mut misc = Misc::new();
+            misc.set_selected_sid(sid);
+            let mut msg = Message::new();
+            msg.set_misc(misc);
+            self.send(Data::Message(msg));
+            let pi = self.lc.read().unwrap().peer_info.clone();
+            if let Some(pi) = pi {
+                if pi.windows_sessions.current_sid == sid {
+                    if self.is_file_transfer() {
+                        if pi.username.is_empty() {
+                            self.on_error(
+                                "No active console user logged on, please connect and logon first.",
+                            );
+                        } else {
+                            #[cfg(not(feature = "flutter"))]
+                            {
+                                let remote_dir = self.get_option("remote_dir".to_string());
+                                let show_hidden =
+                                    !self.get_option("remote_show_hidden".to_string()).is_empty();
+                                self.read_remote_dir(remote_dir, show_hidden);
+                            }
+                        }
+                    } else {
+                        self.msgbox(
+                            "success",
+                            "Successful",
+                            "Connected, waiting for image...",
+                            "",
+                        );
+                    }
+                }
+            }
+        } else {
+            log::error!("selected invalid sid: {}", sid);
+        }
+    }
+
+    #[inline]
+    pub fn request_init_msgs(&self, display: usize) {
+        self.send_message_query(display);
+    }
+
+    fn send_message_query(&self, display: usize) {
+        let mut misc = Misc::new();
+        misc.set_message_query(MessageQuery {
+            switch_display: display as _,
+            ..Default::default()
+        });
+        let mut msg = Message::new();
+        msg.set_misc(misc);
+        self.send(Data::Message(msg));
+    }
+
+    pub fn get_conn_token(&self) -> Option<String> {
+        self.lc.read().unwrap().get_conn_token()
+    }
 }
 
 pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn set_cursor_data(&self, cd: CursorData);
     fn set_cursor_id(&self, id: String);
     fn set_cursor_position(&self, cp: CursorPosition);
-    fn set_display(&self, x: i32, y: i32, w: i32, h: i32);
+    fn set_display(&self, x: i32, y: i32, w: i32, h: i32, cursor_embedded: bool);
     fn switch_display(&self, display: &SwitchDisplay);
     fn set_peer_info(&self, peer_info: &PeerInfo); // flutter
+    fn set_displays(&self, displays: &Vec<DisplayInfo>);
+    fn set_platform_additions(&self, data: &str);
+    fn on_connected(&self, conn_type: ConnType);
     fn update_privacy_mode(&self);
     fn set_permission(&self, name: &str, value: bool);
     fn close_success(&self);
     fn update_quality_status(&self, qs: QualityStatus);
     fn set_connection_type(&self, is_secured: bool, direct: bool);
+    fn set_fingerprint(&self, fingerprint: String);
     fn job_error(&self, id: i32, err: String, file_num: i32);
     fn job_done(&self, id: i32, file_num: i32);
     fn clear_all_jobs(&self);
@@ -1054,14 +1519,38 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
         only_count: bool,
     );
     fn confirm_delete_files(&self, id: i32, i: i32, name: String);
-    fn override_file_confirm(&self, id: i32, file_num: i32, to: String, is_upload: bool);
+    fn override_file_confirm(
+        &self,
+        id: i32,
+        file_num: i32,
+        to: String,
+        is_upload: bool,
+        is_identical: bool,
+    );
     fn update_block_input_state(&self, on: bool);
     fn job_progress(&self, id: i32, file_num: i32, speed: f64, finished_size: f64);
     fn adapt_size(&self);
-    fn on_rgba(&self, data: &[u8]);
-    fn msgbox(&self, msgtype: &str, title: &str, text: &str, retry: bool);
+    fn on_rgba(&self, display: usize, rgba: &mut scrap::ImageRgb);
+    fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str, retry: bool);
     #[cfg(any(target_os = "android", target_os = "ios"))]
     fn clipboard(&self, content: String);
+    fn cancel_msgbox(&self, tag: &str);
+    fn switch_back(&self, id: &str);
+    fn portable_service_running(&self, running: bool);
+    fn on_voice_call_started(&self);
+    fn on_voice_call_closed(&self, reason: &str);
+    fn on_voice_call_waiting(&self);
+    fn on_voice_call_incoming(&self);
+    fn get_rgba(&self, display: usize) -> *const u8;
+    fn next_rgba(&self, display: usize);
+    #[cfg(all(feature = "vram", feature = "flutter"))]
+    fn on_texture(&self, display: usize, texture: *mut c_void);
+    fn set_multiple_windows_session(&self, sessions: Vec<WindowsSession>);
+    fn set_current_display(&self, disp_idx: i32);
+    #[cfg(feature = "flutter")]
+    fn is_multi_ui_session(&self) -> bool;
+    fn update_record_status(&self, start: bool);
+    fn update_empty_dirs(&self, _res: ReadEmptyDirsResponse) {}
 }
 
 impl<T: InvokeUiSession> Deref for Session<T> {
@@ -1082,44 +1571,35 @@ impl<T: InvokeUiSession> FileManager for Session<T> {}
 
 #[async_trait]
 impl<T: InvokeUiSession> Interface for Session<T> {
+    fn get_lch(&self) -> Arc<RwLock<LoginConfigHandler>> {
+        return self.lc.clone();
+    }
+
     fn send(&self, data: Data) {
         if let Some(sender) = self.sender.read().unwrap().as_ref() {
             sender.send(data).ok();
         }
     }
 
-    fn is_file_transfer(&self) -> bool {
-        self.lc
-            .read()
-            .unwrap()
-            .conn_type
-            .eq(&ConnType::FILE_TRANSFER)
+    fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str) {
+        let direct = self.lc.read().unwrap().direct;
+        let received = self.lc.read().unwrap().received;
+        let retry_for_relay = direct == Some(true) && !received;
+        let retry = check_if_retry(msgtype, title, text, retry_for_relay);
+        self.ui_handler.msgbox(msgtype, title, text, link, retry);
     }
 
-    fn is_port_forward(&self) -> bool {
-        self.lc
-            .read()
-            .unwrap()
-            .conn_type
-            .eq(&ConnType::PORT_FORWARD)
+    fn handle_login_error(&self, err: &str) -> bool {
+        handle_login_error(self.lc.clone(), err, self)
     }
 
-    fn is_rdp(&self) -> bool {
-        self.lc.read().unwrap().conn_type.eq(&ConnType::RDP)
+    fn set_multiple_windows_session(&self, sessions: Vec<WindowsSession>) {
+        self.ui_handler.set_multiple_windows_session(sessions);
     }
 
-    fn msgbox(&self, msgtype: &str, title: &str, text: &str) {
-        let retry = check_if_retry(msgtype, title, text);
-        self.ui_handler.msgbox(msgtype, title, text, retry);
-    }
-
-    fn handle_login_error(&mut self, err: &str) -> bool {
-        self.lc.write().unwrap().handle_login_error(err, self)
-    }
-
-    fn handle_peer_info(&mut self, mut pi: PeerInfo) {
+    fn handle_peer_info(&self, mut pi: PeerInfo) {
         log::debug!("handle_peer_info :{:?}", pi);
-        pi.username = self.lc.read().unwrap().get_username(&pi);
+        self.lc.write().unwrap().peer_info = Some(pi.clone());
         if pi.current_display as usize >= pi.displays.len() {
             pi.current_display = 0;
         }
@@ -1127,7 +1607,7 @@ impl<T: InvokeUiSession> Interface for Session<T> {
             self.set_permission("restart", false);
         }
         if self.is_file_transfer() {
-            if pi.username.is_empty() {
+            if pi.username.is_empty() && pi.windows_sessions.sessions.is_empty() {
                 self.on_error("No active console user logged on, please connect and logon first.");
                 return;
             }
@@ -1135,15 +1615,22 @@ impl<T: InvokeUiSession> Interface for Session<T> {
             if pi.displays.is_empty() {
                 self.lc.write().unwrap().handle_peer_info(&pi);
                 self.update_privacy_mode();
-                self.msgbox("error", "Remote Error", "No Display");
+                self.msgbox("error", "Remote Error", "No Displays", "");
                 return;
             }
+            self.try_change_init_resolution(pi.current_display);
             let p = self.lc.read().unwrap().should_auto_login();
             if !p.is_empty() {
                 input_os_password(p, true, self.clone());
             }
             let current = &pi.displays[pi.current_display as usize];
-            self.set_display(current.x, current.y, current.width, current.height);
+            self.set_display(
+                current.x,
+                current.y,
+                current.width,
+                current.height,
+                current.cursor_embedded,
+            );
         }
         self.update_privacy_mode();
         // Save recent peers, then push event to flutter. So flutter can refresh peer page.
@@ -1152,31 +1639,63 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         if self.is_file_transfer() {
             self.close_success();
         } else if !self.is_port_forward() {
-            self.msgbox("success", "Successful", "Connected, waiting for image...");
+            self.msgbox(
+                "success",
+                "Successful",
+                "Connected, waiting for image...",
+                "",
+            );
         }
+        self.on_connected(self.lc.read().unwrap().conn_type);
         #[cfg(windows)]
         {
             let mut path = std::env::temp_dir();
-            path.push(&self.id);
+            path.push(self.get_id());
             let path = path.with_extension(crate::get_app_name().to_lowercase());
             std::fs::File::create(&path).ok();
             if let Some(path) = path.to_str() {
                 crate::platform::windows::add_recent_document(&path);
             }
         }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        self.start_keyboard_hook();
+        if !pi.windows_sessions.sessions.is_empty() {
+            let selected = self
+                .lc
+                .read()
+                .unwrap()
+                .selected_windows_session_id
+                .to_owned();
+            if selected == Some(pi.windows_sessions.current_sid) {
+                self.send_selected_session_id(pi.windows_sessions.current_sid.to_string());
+            } else {
+                self.set_multiple_windows_session(pi.windows_sessions.sessions.clone());
+            }
+        }
     }
 
-    async fn handle_hash(&mut self, pass: &str, hash: Hash, peer: &mut Stream) {
+    async fn handle_hash(&self, pass: &str, hash: Hash, peer: &mut Stream) {
         handle_hash(self.lc.clone(), pass, hash, self, peer).await;
     }
 
-    async fn handle_login_from_ui(&mut self, password: String, remember: bool, peer: &mut Stream) {
-        handle_login_from_ui(self.lc.clone(), password, remember, peer).await;
+    async fn handle_login_from_ui(
+        &self,
+        os_username: String,
+        os_password: String,
+        password: String,
+        remember: bool,
+        peer: &mut Stream,
+    ) {
+        handle_login_from_ui(
+            self.lc.clone(),
+            os_username,
+            os_password,
+            password,
+            remember,
+            peer,
+        )
+        .await;
     }
 
-    async fn handle_test_delay(&mut self, t: TestDelay, peer: &mut Stream) {
+    async fn handle_test_delay(&self, t: TestDelay, peer: &mut Stream) {
         if !t.from_client {
             self.update_quality_status(QualityStatus {
                 delay: Some(t.last_delay as _),
@@ -1187,100 +1706,46 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         }
     }
 
-    fn set_force_relay(&mut self, direct: bool, received: bool) {
-        let mut lc = self.lc.write().unwrap();
-        lc.force_relay = false;
-        if direct && !received {
-            let errno = errno::errno().0;
-            log::info!("errno is {}", errno);
-            // TODO: check mac and ios
-            if cfg!(windows) && errno == 10054 || !cfg!(windows) && errno == 104 {
-                lc.force_relay = true;
-                lc.set_option("force-always-relay".to_owned(), "Y".to_owned());
-            }
-        }
-    }
-
-    fn is_force_relay(&self) -> bool {
-        self.lc.read().unwrap().force_relay
+    fn swap_modifier_mouse(&self, msg: &mut hbb_common::protos::message::MouseEvent) {
+        let allow_swap_key = self.get_toggle_option("allow_swap_key".to_string());
+        if allow_swap_key {
+            msg.modifiers = msg
+                .modifiers
+                .iter()
+                .map(|ck| {
+                    let ck = ck.enum_value_or_default();
+                    let ck = match ck {
+                        ControlKey::Control => ControlKey::Meta,
+                        ControlKey::Meta => ControlKey::Control,
+                        ControlKey::RControl => ControlKey::Meta,
+                        ControlKey::RWin => ControlKey::Control,
+                        _ => ck,
+                    };
+                    hbb_common::protobuf::EnumOrUnknown::new(ck)
+                })
+                .collect();
+        };
     }
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl<T: InvokeUiSession> Session<T> {
-    fn start_keyboard_hook(&self) {
-        if self.is_port_forward() || self.is_file_transfer() {
-            return;
-        }
-        if !KEYBOARD_HOOKED.load(Ordering::SeqCst) {
-            return;
-        }
-        log::info!("keyboard hooked");
-        let me = self.clone();
-        #[cfg(windows)]
-        crate::platform::windows::enable_lowlevel_keyboard(std::ptr::null_mut() as _);
-        std::thread::spawn(move || {
-            // This will block.
-            std::env::set_var("KEYBOARD_ONLY", "y");
-            lazy_static::lazy_static! {
-                static ref MUTEX_SPECIAL_KEYS: Mutex<HashMap<RdevKey, bool>> = {
-                    let mut m = HashMap::new();
-                    m.insert(RdevKey::ShiftLeft, false);
-                    m.insert(RdevKey::ShiftRight, false);
-                    m.insert(RdevKey::ControlLeft, false);
-                    m.insert(RdevKey::ControlRight, false);
-                    m.insert(RdevKey::Alt, false);
-                    m.insert(RdevKey::AltGr, false);
-                    m.insert(RdevKey::MetaLeft, false);
-                    m.insert(RdevKey::MetaRight, false);
-                    Mutex::new(m)
-                };
-            }
-
-            let func = move |evt: Event| {
-                if !IS_IN.load(Ordering::SeqCst) || !SERVER_KEYBOARD_ENABLED.load(Ordering::SeqCst)
-                {
-                    return;
-                }
-                let (_key, down) = match evt.event_type {
-                    KeyPress(k) => {
-                        // keyboard long press
-                        if MUTEX_SPECIAL_KEYS.lock().unwrap().contains_key(&k) {
-                            if *MUTEX_SPECIAL_KEYS.lock().unwrap().get(&k).unwrap() {
-                                return;
-                            }
-                            MUTEX_SPECIAL_KEYS.lock().unwrap().insert(k, true);
-                        }
-                        (k, true)
-                    }
-                    KeyRelease(k) => {
-                        // keyboard long press
-                        if MUTEX_SPECIAL_KEYS.lock().unwrap().contains_key(&k) {
-                            MUTEX_SPECIAL_KEYS.lock().unwrap().insert(k, false);
-                        }
-                        (k, false)
-                    }
-                    _ => return,
-                };
-                me.key_down_or_up(down, _key, evt);
-            };
-            if let Err(error) = rdev::listen(func) {
-                log::error!("rdev: {:?}", error);
-            }
-        });
+    pub fn lock_screen(&self) {
+        self.send_key_event(&crate::keyboard::client::event_lock_screen());
+    }
+    pub fn ctrl_alt_del(&self) {
+        self.send_key_event(&crate::keyboard::client::event_ctrl_alt_del());
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
-pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>) {
+pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let (sender, receiver) = mpsc::unbounded_channel::<Data>();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let (sender, mut receiver) = mpsc::unbounded_channel::<Data>();
     *handler.sender.write().unwrap() = Some(sender.clone());
-    let mut options = crate::ipc::get_options_async().await;
-    let mut key = options.remove("key").unwrap_or("".to_owned());
     let token = LocalConfig::get_option("access_token");
-    if key.is_empty() {
-        key = crate::platform::get_license_key();
-    }
+    let key = crate::get_key(false).await;
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if handler.is_port_forward() {
         if handler.is_rdp() {
@@ -1367,23 +1832,8 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>) {
         }
         return;
     }
-    let frame_count = Arc::new(AtomicUsize::new(0));
-    let frame_count_cl = frame_count.clone();
-    let ui_handler = handler.ui_handler.clone();
-    let (video_sender, audio_sender) = start_video_audio_threads(move |data: &[u8]| {
-        frame_count_cl.fetch_add(1, Ordering::Relaxed);
-        ui_handler.on_rgba(data);
-    });
-
-    let mut remote = Remote::new(
-        handler,
-        video_sender,
-        audio_sender,
-        receiver,
-        sender,
-        frame_count,
-    );
-    remote.io_loop(&key, &token).await;
+    let mut remote = Remote::new(handler, receiver, sender);
+    remote.io_loop(&key, &token, round).await;
     remote.sync_jobs_status_to_local().await;
 }
 
@@ -1398,7 +1848,7 @@ async fn start_one_port_forward<T: InvokeUiSession>(
     token: &str,
 ) {
     if let Err(err) = crate::port_forward::listen(
-        handler.id.clone(),
+        handler.get_id(),
         handler.password.clone(),
         port,
         handler.clone(),
@@ -1417,7 +1867,7 @@ async fn start_one_port_forward<T: InvokeUiSession>(
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn send_note(url: String, id: String, conn_id: i32, note: String) {
-    let body = serde_json::json!({ "id": id, "Id": conn_id, "note": note });
+async fn send_note(url: String, id: String, sid: u64, note: String) {
+    let body = serde_json::json!({ "id": id, "session_id": sid, "note": note });
     allow_err!(crate::post_request(url, body.to_string(), "").await);
 }

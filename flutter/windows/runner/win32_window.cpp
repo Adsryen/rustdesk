@@ -1,8 +1,12 @@
 #include "win32_window.h"
 
 #include <flutter_windows.h>
+#include <shobjidl_core.h>
 
 #include "resource.h"
+
+#include <cstdlib> // for getenv and _putenv
+#include <cstring> // for strcmp
 
 namespace {
 
@@ -42,7 +46,7 @@ class WindowClassRegistrar {
  public:
   ~WindowClassRegistrar() = default;
 
-  // Returns the singleton registar instance.
+  // Returns the singleton registrar instance.
   static WindowClassRegistrar* GetInstance() {
     if (!instance_) {
       instance_ = new WindowClassRegistrar();
@@ -104,7 +108,7 @@ Win32Window::~Win32Window() {
 
 bool Win32Window::CreateAndShow(const std::wstring& title,
                                 const Point& origin,
-                                const Size& size) {
+                                const Size& size, bool showOnTaskBar) {
   Destroy();
 
   const wchar_t* window_class =
@@ -126,7 +130,39 @@ bool Win32Window::CreateAndShow(const std::wstring& title,
     return false;
   }
 
+  if (!showOnTaskBar) {
+    // hide from taskbar
+    HRESULT hr;
+    ITaskbarList* pTaskbarList;
+    hr = CoCreateInstance(CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER,IID_ITaskbarList,(void**)&pTaskbarList);
+    if (FAILED(hr)) {
+        return false;
+    }
+    hr = pTaskbarList->HrInit();
+    hr = pTaskbarList->DeleteTab(window);
+    hr = pTaskbarList->Release();
+  }
+
   return OnCreate();
+}
+
+static void trySetWindowForeground(HWND window) {
+    char* value = nullptr;
+    size_t size = 0;
+    // Use _dupenv_s to safely get the environment variable
+    _dupenv_s(&value, &size, "SET_FOREGROUND_WINDOW");
+
+    if (value != nullptr) {
+        // Correctly compare the value with "1"
+        if (strcmp(value, "1") == 0) {
+            // Clear the environment variable
+            _putenv("SET_FOREGROUND_WINDOW=");
+            // Set the window to foreground
+            SetForegroundWindow(window);
+        }
+        // Free the duplicated string
+        free(value);
+    }
 }
 
 // static
@@ -142,6 +178,7 @@ LRESULT CALLBACK Win32Window::WndProc(HWND const window,
     auto that = static_cast<Win32Window*>(window_struct->lpCreateParams);
     EnableFullDpiSupportIfAvailable(window);
     that->window_handle_ = window;
+    trySetWindowForeground(window);
   } else if (Win32Window* that = GetThisFromHandle(window)) {
     return that->MessageHandler(window, message, wparam, lparam);
   }
@@ -242,4 +279,8 @@ bool Win32Window::OnCreate() {
 
 void Win32Window::OnDestroy() {
   // No-op; provided for subclasses.
+}
+
+const wchar_t* getWindowClassName() {
+  return kWindowClassName;
 }

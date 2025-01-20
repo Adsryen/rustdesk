@@ -2,11 +2,6 @@
 use crate::ipc::start_pa;
 use crate::ui_cm_interface::{start_ipc, ConnectionManager, InvokeUiCM};
 
-#[cfg(windows)]
-use clipboard::{
-    create_cliprdr_context, empty_clipboard, get_rx_clip_client, server_clip_file, set_conn_enabled,
-};
-
 use hbb_common::{allow_err, log};
 use sciter::{make_args, Element, Value, HELEMENT};
 use std::sync::Mutex;
@@ -33,13 +28,14 @@ impl InvokeUiCM for SciterHandler {
                 client.audio,
                 client.file,
                 client.restart,
-                client.recording
+                client.recording,
+                client.block_input
             ),
         );
     }
 
-    fn remove_connection(&self, id: i32) {
-        self.call("removeConnection", &make_args!(id));
+    fn remove_connection(&self, id: i32, close: bool) {
+        self.call("removeConnection", &make_args!(id, close));
         if crate::ui_cm_interface::get_clients_length().eq(&0) {
             crate::platform::quit_gui();
         }
@@ -56,6 +52,19 @@ impl InvokeUiCM for SciterHandler {
     fn change_language(&self) {
         // TODO
     }
+
+    fn show_elevation(&self, show: bool) {
+        self.call("showElevation", &make_args!(show));
+    }
+
+    fn update_voice_call_state(&self, client: &crate::ui_cm_interface::Client) {
+        self.call(
+            "updateVoiceCallState",
+            &make_args!(client.id, client.in_voice_call, client.incoming_voice_call),
+        );
+    }
+
+    fn file_transfer_log(&self, _action: &str, _log: &str) {}
 }
 
 impl SciterHandler {
@@ -90,7 +99,7 @@ impl SciterConnectionManager {
     }
 
     fn get_icon(&mut self) -> String {
-        crate::get_icon()
+        super::get_icon()
     }
 
     fn check_click_time(&mut self, id: i32) {
@@ -109,6 +118,14 @@ impl SciterConnectionManager {
         crate::ui_cm_interface::close(id);
     }
 
+    fn remove_disconnected_connection(&self, id: i32) {
+        crate::ui_cm_interface::remove(id);
+    }
+
+    fn quit(&self) {
+        crate::platform::quit_gui();
+    }
+
     fn authorize(&self, id: i32) {
         crate::ui_cm_interface::authorize(id);
     }
@@ -119,6 +136,18 @@ impl SciterConnectionManager {
 
     fn t(&self, name: String) -> String {
         crate::client::translate(name)
+    }
+
+    fn can_elevate(&self) -> bool {
+        crate::ui_cm_interface::can_elevate()
+    }
+
+    fn elevate_portable(&self, id: i32) {
+        crate::ui_cm_interface::elevate_portable(id);
+    }
+
+    fn get_option(&self, key: String) -> String {
+        crate::ui_interface::get_option(key)
     }
 }
 
@@ -133,8 +162,13 @@ impl sciter::EventHandler for SciterConnectionManager {
         fn get_click_time();
         fn get_icon();
         fn close(i32);
+        fn remove_disconnected_connection(i32);
+        fn quit();
         fn authorize(i32);
         fn switch_permission(i32, String, bool);
         fn send_msg(i32, String);
+        fn can_elevate();
+        fn elevate_portable(i32);
+        fn get_option(String);
     }
 }

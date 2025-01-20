@@ -1,5 +1,4 @@
-use hbb_common::anyhow::Error;
-use hbb_common::{bail, ResultType};
+use hbb_common::{anyhow::Error, bail, log, ResultType};
 use ndk::media::media_codec::{MediaCodec, MediaCodecDirection, MediaFormat};
 use std::ops::Deref;
 use std::{
@@ -8,9 +7,10 @@ use std::{
     time::Duration,
 };
 
+use crate::ImageFormat;
 use crate::{
     codec::{EncoderApi, EncoderCfg},
-    I420ToARGB,
+    CodecFormat, I420ToABGR, I420ToARGB, ImageRgb,
 };
 
 /// MediaCodec mime type name
@@ -37,19 +37,22 @@ impl Deref for MediaCodecDecoder {
     }
 }
 
-pub struct MediaCodecDecoders {
-    pub h264: Option<MediaCodecDecoder>,
-    pub h265: Option<MediaCodecDecoder>,
-}
-
 impl MediaCodecDecoder {
-    pub fn new_decoders() -> MediaCodecDecoders {
-        let h264 = create_media_codec(H264_MIME_TYPE, MediaCodecDirection::Decoder);
-        let h265 = create_media_codec(H265_MIME_TYPE, MediaCodecDirection::Decoder);
-        MediaCodecDecoders { h264, h265 }
+    pub fn new(format: CodecFormat) -> Option<MediaCodecDecoder> {
+        match format {
+            CodecFormat::H264 => create_media_codec(H264_MIME_TYPE, MediaCodecDirection::Decoder),
+            CodecFormat::H265 => create_media_codec(H265_MIME_TYPE, MediaCodecDirection::Decoder),
+            _ => {
+                log::error!("Unsupported codec format: {}", format);
+                None
+            }
+        }
     }
 
-    pub fn decode(&mut self, data: &[u8], rgb: &mut Vec<u8>) -> ResultType<bool> {
+    // rgb [in/out] fmt and stride must be set in ImageRgb
+    pub fn decode(&mut self, data: &[u8], rgb: &mut ImageRgb) -> ResultType<bool> {
+        // take dst_stride into account please
+        let dst_stride = rgb.stride();
         match self.dequeue_input_buffer(Duration::from_millis(10))? {
             Some(mut input_buffer) => {
                 let mut buf = input_buffer.buffer_mut();
@@ -82,23 +85,44 @@ impl MediaCodecDecoder {
                 let bps = 4;
                 let u = buf.len() * 2 / 3;
                 let v = buf.len() * 5 / 6;
-                rgb.resize(h * w * bps, 0);
+                rgb.raw.resize(h * w * bps, 0);
                 let y_ptr = buf.as_ptr();
                 let u_ptr = buf[u..].as_ptr();
                 let v_ptr = buf[v..].as_ptr();
                 unsafe {
-                    I420ToARGB(
-                        y_ptr,
-                        stride,
-                        u_ptr,
-                        stride / 2,
-                        v_ptr,
-                        stride / 2,
-                        rgb.as_mut_ptr(),
-                        (w * bps) as _,
-                        w as _,
-                        h as _,
-                    );
+                    match rgb.fmt() {
+                        ImageFormat::ARGB => {
+                            I420ToARGB(
+                                y_ptr,
+                                stride,
+                                u_ptr,
+                                stride / 2,
+                                v_ptr,
+                                stride / 2,
+                                rgb.raw.as_mut_ptr(),
+                                (w * bps) as _,
+                                w as _,
+                                h as _,
+                            );
+                        }
+                        ImageFormat::ARGB => {
+                            I420ToABGR(
+                                y_ptr,
+                                stride,
+                                u_ptr,
+                                stride / 2,
+                                v_ptr,
+                                stride / 2,
+                                rgb.raw.as_mut_ptr(),
+                                (w * bps) as _,
+                                w as _,
+                                h as _,
+                            );
+                        }
+                        _ => {
+                            bail!("Unsupported image format");
+                        }
+                    }
                 }
                 self.release_output_buffer(output_buffer, false)?;
                 Ok(true)
@@ -119,12 +143,12 @@ fn create_media_codec(name: &str, direction: MediaCodecDirection) -> Option<Medi
     media_format.set_i32("height", 0);
     media_format.set_i32("color-format", 19); // COLOR_FormatYUV420Planar
     if let Err(e) = codec.configure(&media_format, None, direction) {
-        log::error!("Failed to init decoder:{:?}", e);
+        log::error!("Failed to init decoder: {:?}", e);
         return None;
     };
     log::error!("decoder init success");
     if let Err(e) = codec.start() {
-        log::error!("Failed to start decoder:{:?}", e);
+        log::error!("Failed to start decoder: {:?}", e);
         return None;
     };
     log::debug!("Init decoder successed!: {:?}", name);

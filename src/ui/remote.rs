@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use sciter::{
@@ -14,21 +14,12 @@ use sciter::{
     Value,
 };
 
-#[cfg(windows)]
-use clipboard::{
-    cliprdr::CliprdrClientContext, create_cliprdr_context as create_clipboard_file_context,
-    get_rx_clip_client, server_clip_file,
-};
-
 use hbb_common::{
     allow_err, fs::TransferJobMeta, log, message_proto::*, rendezvous_proto::ConnType,
 };
 
-#[cfg(windows)]
-use crate::clipboard_file::*;
 use crate::{
     client::*,
-    ui_interface::has_hwcodec,
     ui_session_interface::{InvokeUiSession, Session},
 };
 
@@ -61,6 +52,20 @@ impl SciterHandler {
             allow_err!(e.call_method(func, &super::value_crash_workaround(args)[..]));
         }
     }
+
+    fn make_displays_array(displays: &Vec<DisplayInfo>) -> Value {
+        let mut displays_value = Value::array(0);
+        for d in displays.iter() {
+            let mut display = Value::map();
+            display.set_item("x", d.x);
+            display.set_item("y", d.y);
+            display.set_item("width", d.width);
+            display.set_item("height", d.height);
+            display.set_item("cursor_embedded", d.cursor_embedded);
+            displays_value.push(display);
+        }
+        displays_value
+    }
 }
 
 impl InvokeUiSession for SciterHandler {
@@ -87,8 +92,8 @@ impl InvokeUiSession for SciterHandler {
         }
     }
 
-    fn set_display(&self, x: i32, y: i32, w: i32, h: i32) {
-        self.call("setDisplay", &make_args!(x, y, w, h));
+    fn set_display(&self, x: i32, y: i32, w: i32, h: i32, cursor_embedded: bool) {
+        self.call("setDisplay", &make_args!(x, y, w, h, cursor_embedded));
         // https://sciter.com/forums/topic/color_spaceiyuv-crash
         // Nothing spectacular in decoder – done on CPU side.
         // So if you can do BGRA translation on your side – the better.
@@ -117,12 +122,17 @@ impl InvokeUiSession for SciterHandler {
             "updateQualityStatus",
             &make_args!(
                 status.speed.map_or(Value::null(), |it| it.into()),
-                status.fps.map_or(Value::null(), |it| it.into()),
+                status
+                    .fps
+                    .iter()
+                    .next()
+                    .map_or(Value::null(), |(_, v)| (*v).into()),
                 status.delay.map_or(Value::null(), |it| it.into()),
                 status.target_bitrate.map_or(Value::null(), |it| it.into()),
                 status
                     .codec_format
-                    .map_or(Value::null(), |it| it.to_string().into())
+                    .map_or(Value::null(), |it| it.to_string().into()),
+                status.chroma.map_or(Value::null(), |it| it.into())
             ),
         );
     }
@@ -138,6 +148,8 @@ impl InvokeUiSession for SciterHandler {
     fn set_connection_type(&self, is_secured: bool, direct: bool) {
         self.call("setConnectionType", &make_args!(is_secured, direct));
     }
+
+    fn set_fingerprint(&self, _fingerprint: String) {}
 
     fn job_error(&self, id: i32, err: String, file_num: i32) {
         self.call("jobError", &make_args!(id, err, file_num));
@@ -191,10 +203,17 @@ impl InvokeUiSession for SciterHandler {
         self.call("confirmDeleteFiles", &make_args!(id, i, name));
     }
 
-    fn override_file_confirm(&self, id: i32, file_num: i32, to: String, is_upload: bool) {
+    fn override_file_confirm(
+        &self,
+        id: i32,
+        file_num: i32,
+        to: String,
+        is_upload: bool,
+        is_identical: bool,
+    ) {
         self.call(
             "overrideFileConfirm",
-            &make_args!(id, file_num, to, is_upload),
+            &make_args!(id, file_num, to, is_upload, is_identical),
         );
     }
 
@@ -209,12 +228,12 @@ impl InvokeUiSession for SciterHandler {
         self.call("adaptSize", &make_args!());
     }
 
-    fn on_rgba(&self, data: &[u8]) {
+    fn on_rgba(&self, _display: usize, rgba: &mut scrap::ImageRgb) {
         VIDEO
             .lock()
             .unwrap()
             .as_mut()
-            .map(|v| v.render_frame(data).ok());
+            .map(|v| v.render_frame(&rgba.raw).ok());
     }
 
     fn set_peer_info(&self, pi: &PeerInfo) {
@@ -223,23 +242,59 @@ impl InvokeUiSession for SciterHandler {
         pi_sciter.set_item("hostname", pi.hostname.clone());
         pi_sciter.set_item("platform", pi.platform.clone());
         pi_sciter.set_item("sas_enabled", pi.sas_enabled);
-
-        let mut displays = Value::array(0);
-        for ref d in pi.displays.iter() {
-            let mut display = Value::map();
-            display.set_item("x", d.x);
-            display.set_item("y", d.y);
-            display.set_item("width", d.width);
-            display.set_item("height", d.height);
-            displays.push(display);
-        }
-        pi_sciter.set_item("displays", displays);
+        pi_sciter.set_item("displays", Self::make_displays_array(&pi.displays));
         pi_sciter.set_item("current_display", pi.current_display);
+        pi_sciter.set_item("version", pi.version.clone());
         self.call("updatePi", &make_args!(pi_sciter));
     }
 
-    fn msgbox(&self, msgtype: &str, title: &str, text: &str, retry: bool) {
-        self.call2("msgbox_retry", &make_args!(msgtype, title, text, retry));
+    fn set_displays(&self, displays: &Vec<DisplayInfo>) {
+        self.call(
+            "updateDisplays",
+            &make_args!(Self::make_displays_array(displays)),
+        );
+    }
+
+    fn set_platform_additions(&self, _data: &str) {
+        // Ignore for sciter version.
+    }
+
+    fn set_current_display(&self, _disp_idx: i32) {
+        self.call("setCurrentDisplay", &make_args!(_disp_idx));
+    }
+
+    fn set_multiple_windows_session(&self, sessions: Vec<WindowsSession>) {
+        let mut v = Value::array(0);
+        let mut sessions = sessions;
+        for s in sessions.drain(..) {
+            let mut obj = Value::map();
+            obj.set_item("sid", s.sid.to_string());
+            obj.set_item("name", s.name);
+            v.push(obj);
+        }
+        self.call("setMultipleWindowsSession", &make_args!(v));
+    }
+
+    fn on_connected(&self, conn_type: ConnType) {
+        match conn_type {
+            ConnType::RDP => {}
+            ConnType::PORT_FORWARD => {}
+            ConnType::FILE_TRANSFER => {}
+            ConnType::DEFAULT_CONN => {
+                crate::keyboard::client::start_grab_loop();
+            }
+        }
+    }
+
+    fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str, retry: bool) {
+        self.call2(
+            "msgbox_retry",
+            &make_args!(msgtype, title, text, link, retry),
+        );
+    }
+
+    fn cancel_msgbox(&self, tag: &str) {
+        self.call("cancel_msgbox", &make_args!(tag));
     }
 
     fn new_message(&self, msg: String) {
@@ -252,6 +307,37 @@ impl InvokeUiSession for SciterHandler {
 
     fn update_block_input_state(&self, on: bool) {
         self.call("updateBlockInputState", &make_args!(on));
+    }
+
+    fn switch_back(&self, _id: &str) {}
+
+    fn portable_service_running(&self, _running: bool) {}
+
+    fn on_voice_call_started(&self) {
+        self.call("onVoiceCallStart", &make_args!());
+    }
+
+    fn on_voice_call_closed(&self, reason: &str) {
+        self.call("onVoiceCallClosed", &make_args!(reason));
+    }
+
+    fn on_voice_call_waiting(&self) {
+        self.call("onVoiceCallWaiting", &make_args!());
+    }
+
+    fn on_voice_call_incoming(&self) {
+        self.call("onVoiceCallIncoming", &make_args!());
+    }
+
+    /// RGBA is directly rendered by [on_rgba]. No need to store the rgba for the sciter ui.
+    fn get_rgba(&self, _display: usize) -> *const u8 {
+        std::ptr::null()
+    }
+
+    fn next_rgba(&self, _display: usize) {}
+
+    fn update_record_status(&self, start: bool) {
+        self.call("updateRecordStatus", &make_args!(start));
     }
 }
 
@@ -310,7 +396,7 @@ impl sciter::EventHandler for SciterSession {
                     let site = AssetPtr::adopt(ptr as *mut video_destination);
                     log::debug!("[video] start video");
                     *VIDEO.lock().unwrap() = Some(site);
-                    self.reconnect();
+                    self.reconnect(false);
                 }
             }
             BEHAVIOR_EVENTS::VIDEO_INITIALIZED => {
@@ -321,7 +407,7 @@ impl sciter::EventHandler for SciterSession {
                 let source = Element::from(source);
                 use sciter::dom::ELEMENT_AREAS;
                 let flags = ELEMENT_AREAS::CONTENT_BOX as u32 | ELEMENT_AREAS::SELF_RELATIVE as u32;
-                let rc = source.get_location(flags).unwrap();
+                let rc = source.get_location(flags).unwrap_or_default();
                 log::debug!(
                     "[video] start video thread on <{}> which is about {:?} pixels",
                     source,
@@ -337,7 +423,7 @@ impl sciter::EventHandler for SciterSession {
     }
 
     sciter::dispatch_script_call! {
-        fn get_audit_server();
+        fn get_audit_server(String);
         fn send_note(String);
         fn is_xfce();
         fn get_id();
@@ -350,16 +436,18 @@ impl sciter::EventHandler for SciterSession {
         fn is_file_transfer();
         fn is_port_forward();
         fn is_rdp();
-        fn login(String, bool);
+        fn login(String, String, String, bool);
+        fn send2fa(String, bool);
+        fn get_enable_trusted_devices();
         fn new_rdp();
         fn send_mouse(i32, i32, i32, bool, bool, bool, bool);
-        fn enter();
-        fn leave();
+        fn enter(String);
+        fn leave(String);
         fn ctrl_alt_del();
         fn transfer_file();
         fn tunnel();
         fn lock_screen();
-        fn reconnect();
+        fn reconnect(bool);
         fn get_chatbox();
         fn get_icon();
         fn get_home_dir();
@@ -393,8 +481,8 @@ impl sciter::EventHandler for SciterSession {
         fn save_view_style(String);
         fn save_image_quality(String);
         fn save_custom_image_quality(i32);
-        fn refresh_video();
-        fn record_screen(bool, i32, i32);
+        fn refresh_video(i32);
+        fn record_screen(bool);
         fn get_toggle_option(String);
         fn is_privacy_mode_supported();
         fn toggle_option(String);
@@ -402,20 +490,28 @@ impl sciter::EventHandler for SciterSession {
         fn peer_platform();
         fn set_write_override(i32, i32, bool, bool, bool);
         fn get_keyboard_mode();
+        fn is_keyboard_mode_supported(String);
         fn save_keyboard_mode(String);
-        fn has_hwcodec();
-        fn supported_hwcodec();
+        fn alternative_codecs();
         fn change_prefer_codec();
         fn restart_remote_device();
+        fn request_voice_call();
+        fn close_voice_call();
+        fn version_cmp(String, String);
+        fn set_selected_windows_session_id(String);
+        fn is_recording();
     }
 }
 
 impl SciterSession {
     pub fn new(cmd: String, id: String, password: String, args: Vec<String>) -> Self {
+        let force_relay = args.contains(&"--relay".to_string());
         let session: Session<SciterHandler> = Session {
-            id: id.clone(),
             password: password.clone(),
             args,
+            server_keyboard_enabled: Arc::new(RwLock::new(true)),
+            server_file_transfer_enabled: Arc::new(RwLock::new(true)),
+            server_clipboard_enabled: Arc::new(RwLock::new(true)),
             ..Default::default()
         };
 
@@ -429,9 +525,17 @@ impl SciterSession {
             ConnType::DEFAULT_CONN
         };
 
-        session.lc.write().unwrap().initialize(id, conn_type);
+        session
+            .lc
+            .write()
+            .unwrap()
+            .initialize(id, conn_type, None, force_relay, None, None, None);
 
         Self(session)
+    }
+
+    pub fn inner(&self) -> Session<SciterHandler> {
+        self.0.clone()
     }
 
     fn get_custom_image_quality(&mut self) -> Value {
@@ -442,21 +546,19 @@ impl SciterSession {
         v
     }
 
-    fn has_hwcodec(&self) -> bool {
-        has_hwcodec()
-    }
-
     pub fn t(&self, name: String) -> String {
         crate::client::translate(name)
     }
 
     pub fn get_icon(&self) -> String {
-        crate::get_icon()
+        super::get_icon()
     }
 
-    fn supported_hwcodec(&self) -> Value {
-        let (h264, h265) = self.0.supported_hwcodec();
+    fn alternative_codecs(&self) -> Value {
+        let (vp8, av1, h264, h265) = self.0.alternative_codecs();
         let mut v = Value::array(0);
+        v.push(vp8);
+        v.push(av1);
         v.push(h264);
         v.push(h265);
         v
@@ -499,6 +601,10 @@ impl SciterSession {
         }
         self.save_config(config);
         log::info!("size saved");
+    }
+
+    fn set_selected_windows_session_id(&mut self, u_sid: String) {
+        self.send_selected_session_id(u_sid);
     }
 
     fn get_port_forwards(&mut self) -> Value {
@@ -684,6 +790,10 @@ impl SciterSession {
         if let Err(err) = crate::run_me(args) {
             log::error!("Failed to spawn IP tunneling: {}", err);
         }
+    }
+
+    fn version_cmp(&self, v1: String, v2: String) -> i32 {
+        (hbb_common::get_version_number(&v1) - hbb_common::get_version_number(&v2)) as i32
     }
 }
 

@@ -76,28 +76,34 @@ class AddressBook: Reactor.Component
     
     event click $(#add-id) (_, __) {
         var me = this;
-        msgbox("custom-add-id", translate("Add ID"), <div .form>
+        msgbox(
+            "custom-add-id",
+            translate("Add ID"),
+            <div .form>
             <div>{translate("whitelist_sep")}</div> 
             <textarea .outline-focus spellcheck="false" name="text" style="overflow: scroll-indicator; width:*; height: 160px; font-size: 1.2em; padding: 0.5em;"></textarea>
-            </div>, function(res=null) {
-            if (!res) return;
-            var value = (res.text || "").trim();
-            var values = value.split(/[\s,;\n]+/g);
-            if (values.length == 0) return;
-            for (var v in values) {
-                var found;
-                for (var i = 0; i < ab.peers.length; ++i) {
-                    if (ab.peers[i].id == v) {
-                        found = true;
-                        break;
+            </div>,
+            "",
+            function(res=null) {
+                if (!res) return;
+                var value = (res.text || "").trim();
+                var values = value.split(/[\s,;\n]+/g);
+                if (values.length == 0) return;
+                for (var v in values) {
+                    var found;
+                    for (var i = 0; i < ab.peers.length; ++i) {
+                        if (ab.peers[i].id == v) {
+                            found = true;
+                            break;
+                        }
                     }
+                    if (found) continue;
+                    ab.peers.push({ id: v });
                 }
-                if (found) continue;
-                ab.peers.push({ id: v });
-            }
-            updateAb();
-            me.update();
-        }, 300);
+                updateAb();
+                me.update();
+            },
+        300);
     }
     
     event click $(#add-tag) (_, __) {
@@ -105,7 +111,7 @@ class AddressBook: Reactor.Component
         msgbox("custom-add-tag", translate("Add Tag"), <div .form>
             <div>{translate("whitelist_sep")}</div> 
             <textarea .outline-focus spellcheck="false" name="text" style="overflow: scroll-indicator; width:*; height: 160px; font-size: 1.2em; padding: 0.5em;"></textarea>
-            </div>, function(res=null) {
+            </div>, "", function(res=null) {
             if (!res) return;
             var value = (res.text || "").trim();
             var values = value.split(/[\s,;\n]+/g);
@@ -319,16 +325,16 @@ class SessionList: Reactor.Component {
             <popup>
                 <menu.context #remote-context>
                     <li #connect>{translate('Connect')}</li>
-                    <li #transfer>{translate('Transfer File')}</li>
-                    <li #tunnel>{translate('TCP Tunneling')}</li>
+                    <li #transfer>{translate('Transfer file')}</li>
+                    <li #tunnel>{translate('TCP tunneling')}</li>
                     <li #force-always-relay><span>{svg_checkmark}</span>{translate('Always connect via relay')}</li>
                     <li #rdp>RDP<EditRdpPort /></li>
                     <li #wol>{translate('WOL')}</li>
                     <div .separator />
                     {this.type != "lan" && <li #rename>{translate('Rename')}</li>}
                     {this.type != "fav" && <li #remove>{translate('Remove')}</li>}
-                    {is_win && <li #shortcut>{translate('Create Desktop Shortcut')}</li>}
-                    <li #forget-password>{translate('Unremember Password')}</li>
+                    {is_win && <li #shortcut>{translate('Create desktop shortcut')}</li>}
+                    <li #forget-password>{translate('Forget Password')}</li>
                     {(!this.type || this.type == "fav") && <li #add-fav>{translate('Add to Favorites')}</li>}
                     {(!this.type || this.type == "fav") && <li #remove-fav>{translate('Remove from Favorites')}</li>}
                     {this.type == "ab" && <li #edit-tag>{translate('Edit Tag')}</li>}
@@ -483,7 +489,7 @@ class SessionList: Reactor.Component {
             msgbox("custom-rename", "Rename", "<div .form> \
                 <div><input|text name='name' .outline-focus style='width: *; height: 23px', value='" + old_name + "' /></div> \
                 </div> \
-                ", function(res=null) {
+                ", "", function(res=null) {
                     if (!res) return;
                     var name = (res.name || "").trim();
                     if (name != old_name) {
@@ -506,7 +512,7 @@ class SessionList: Reactor.Component {
                 }
             }
             if (!peer) return;
-            msgbox("custom-edit-tag", "Edit Tag", <SelectTags tags={peer.tags || []} />, function(res=null) {
+            msgbox("custom-edit-tag", "Edit Tag", <SelectTags tags={peer.tags || []} />, "", function(res=null) {
                     if (!res) return;
                     peer.tags = selectTags.tags;
                     updateAb();
@@ -534,10 +540,10 @@ class MultipleSessions: Reactor.Component {
         return  <div style="size: *">
                 <div .sessions-bar>
                     <div style="width:*" .sessions-tab #sessions-type>
-                        <span class={!type ? 'active' : 'inactive'}>{translate('Recent Sessions')}</span>
+                        <span class={!type ? 'active' : 'inactive'}>{translate('Recent sessions')}</span>
                         <span #fav class={type == "fav" ? 'active' : 'inactive'}>{translate('Favorites')}</span>
                         {handler.is_installed() && <span #lan class={type == "lan" ? 'active' : 'inactive'}>{translate('Discovered')}</span>}
-                        <span #ab class={type == "ab" ? 'active' : 'inactive'}>{translate('Address Book')}</span>
+                        <span #ab class={type == "ab" ? 'active' : 'inactive'}>{translate('Address book')}</span>
                     </div>
                     {!this.hidden && <SearchBar type={type} />}
                     {!this.hidden && <SessionStyle type={type} />}
@@ -572,7 +578,7 @@ class MultipleSessions: Reactor.Component {
 
     function onSize() {
         var w = this.$(.sessions-bar .sessions-tab).box(#width);
-        var len = translate('Recent Sessions').length;
+        var len = translate('Recent sessions').length;
         var totalChars = 0;
         var nEle = 0;
         for (var el in this.$$(#sessions-type span)) {
@@ -738,7 +744,7 @@ function editRdpPort() {
             <div><span>{translate('Port')}:</span>{port}</div> 
             <div><span>{translate('Username')}:</span><input|text name="username" value={name0} /></div> 
             <div><span>{translate('Password')}:</span><PasswordComponent value={pass0} /></div> 
-        </div>, function(res=null) {
+        </div>, "", function(res=null) {
         if (!res) return;
         var p = (res.port || '').trim();
         if (p != p0) {

@@ -4,6 +4,7 @@
 
 use super::{CursorData, ResultType};
 use cocoa::{
+    appkit::{NSApp, NSApplication, NSApplicationActivationPolicy::*},
     base::{id, nil, BOOL, NO, YES},
     foundation::{NSDictionary, NSPoint, NSSize, NSString},
 };
@@ -16,10 +17,17 @@ use core_graphics::{
     display::{kCGNullWindowID, kCGWindowListOptionOnScreenOnly, CGWindowListCopyWindowInfo},
     window::{kCGWindowName, kCGWindowOwnerPID},
 };
-use hbb_common::{bail, log};
+use hbb_common::{
+    anyhow::anyhow,
+    bail, log,
+    message_proto::{DisplayInfo, Resolution},
+    sysinfo::{Pid, Process, ProcessRefreshKind, System},
+};
 use include_dir::{include_dir, Dir};
+use objc::rc::autoreleasepool;
 use objc::{class, msg_send, sel, sel_impl};
 use scrap::{libc::c_void, quartz::ffi::*};
+use std::path::{Path, PathBuf};
 
 static PRIVILEGES_SCRIPTS_DIR: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/src/platform/privileges_scripts");
@@ -31,9 +39,32 @@ extern "C" {
     fn CGEventGetLocation(e: *const c_void) -> CGPoint;
     static kAXTrustedCheckOptionPrompt: CFStringRef;
     fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> BOOL;
+    fn InputMonitoringAuthStatus(_: BOOL) -> BOOL;
+    fn IsCanScreenRecording(_: BOOL) -> BOOL;
+    fn CanUseNewApiForScreenCaptureCheck() -> BOOL;
+    fn MacCheckAdminAuthorization() -> BOOL;
+    fn MacGetModeNum(display: u32, numModes: *mut u32) -> BOOL;
+    fn MacGetModes(
+        display: u32,
+        widths: *mut u32,
+        heights: *mut u32,
+        max: u32,
+        numModes: *mut u32,
+    ) -> BOOL;
+    fn majorVersion() -> u32;
+    fn MacGetMode(display: u32, width: *mut u32, height: *mut u32) -> BOOL;
+    fn MacSetMode(display: u32, width: u32, height: u32) -> BOOL;
+}
+
+pub fn major_version() -> u32 {
+    unsafe { majorVersion() }
 }
 
 pub fn is_process_trusted(prompt: bool) -> bool {
+    autoreleasepool(|| unsafe_is_process_trusted(prompt))
+}
+
+fn unsafe_is_process_trusted(prompt: bool) -> bool {
     unsafe {
         let value = if prompt { YES } else { NO };
         let value: id = msg_send![class!(NSNumber), numberWithBool: value];
@@ -46,10 +77,29 @@ pub fn is_process_trusted(prompt: bool) -> bool {
     }
 }
 
+pub fn is_can_input_monitoring(prompt: bool) -> bool {
+    unsafe {
+        let value = if prompt { YES } else { NO };
+        InputMonitoringAuthStatus(value) == YES
+    }
+}
+
+pub fn is_can_screen_recording(prompt: bool) -> bool {
+    autoreleasepool(|| unsafe_is_can_screen_recording(prompt))
+}
+
 // macOS >= 10.15
 // https://stackoverflow.com/questions/56597221/detecting-screen-recording-settings-on-macos-catalina/
 // remove just one app from all the permissions: tccutil reset All com.carriez.rustdesk
-pub fn is_can_screen_recording(prompt: bool) -> bool {
+fn unsafe_is_can_screen_recording(prompt: bool) -> bool {
+    // we got some report that we show no permission even after set it, so we try to use new api for screen recording check
+    // the new api is only available on macOS >= 10.15, but on stackoverflow, some people said it works on >= 10.16 (crash on 10.15),
+    // but also some said it has bug on 10.16, so we just use it on 11.0.
+    unsafe {
+        if CanUseNewApiForScreenCaptureCheck() == YES {
+            return IsCanScreenRecording(if prompt { YES } else { NO }) == YES;
+        }
+    }
     let mut can_record_screen: bool = false;
     unsafe {
         let our_pid: i32 = std::process::id() as _;
@@ -95,10 +145,14 @@ pub fn is_can_screen_recording(prompt: bool) -> bool {
     if !can_record_screen && prompt {
         use scrap::{Capturer, Display};
         if let Ok(d) = Display::primary() {
-            Capturer::new(d, true).ok();
+            Capturer::new(d).ok();
         }
     }
     can_record_screen
+}
+
+pub fn install_service() -> bool {
+    is_installed_daemon(false)
 }
 
 pub fn is_installed_daemon(prompt: bool) -> bool {
@@ -115,14 +169,26 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
         return true;
     }
 
-    let install_script = PRIVILEGES_SCRIPTS_DIR.get_file("install.scpt").unwrap();
-    let install_script_body = install_script.contents_utf8().unwrap();
+    let Some(install_script) = PRIVILEGES_SCRIPTS_DIR.get_file("install.scpt") else {
+        return false;
+    };
+    let Some(install_script_body) = install_script.contents_utf8().map(correct_app_name) else {
+        return false;
+    };
 
-    let daemon_plist = PRIVILEGES_SCRIPTS_DIR.get_file(&daemon).unwrap();
-    let daemon_plist_body = daemon_plist.contents_utf8().unwrap();
+    let Some(daemon_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("daemon.plist") else {
+        return false;
+    };
+    let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(correct_app_name) else {
+        return false;
+    };
 
-    let agent_plist = PRIVILEGES_SCRIPTS_DIR.get_file(&agent).unwrap();
-    let agent_plist_body = agent_plist.contents_utf8().unwrap();
+    let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
+        return false;
+    };
+    let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
+        return false;
+    };
 
     std::thread::spawn(move || {
         match std::process::Command::new("osascript")
@@ -145,15 +211,6 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
                         .args(&["load", "-w", &agent_plist_file])
                         .status()
                         .ok();
-                    std::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(&format!(
-                            "sleep 0.5; open -n /Applications/{}.app",
-                            crate::get_app_name(),
-                        ))
-                        .spawn()
-                        .ok();
-                    quit_gui();
                 }
             }
         }
@@ -161,16 +218,26 @@ pub fn is_installed_daemon(prompt: bool) -> bool {
     false
 }
 
-pub fn uninstall() -> bool {
+fn correct_app_name(s: &str) -> String {
+    let s = s.replace("rustdesk", &crate::get_app_name().to_lowercase());
+    let s = s.replace("RustDesk", &crate::get_app_name());
+    s
+}
+
+pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
     // to-do: do together with win/linux about refactory start/stop service
     if !is_installed_daemon(false) {
         return false;
     }
 
-    let script_file = PRIVILEGES_SCRIPTS_DIR.get_file("uninstall.scpt").unwrap();
-    let script_body = script_file.contents_utf8().unwrap();
+    let Some(script_file) = PRIVILEGES_SCRIPTS_DIR.get_file("uninstall.scpt") else {
+        return false;
+    };
+    let Some(script_body) = script_file.contents_utf8().map(correct_app_name) else {
+        return false;
+    };
 
-    std::thread::spawn(move || {
+    let func = move || {
         match std::process::Command::new("osascript")
             .arg("-e")
             .arg(script_body)
@@ -189,26 +256,35 @@ pub fn uninstall() -> bool {
                     uninstalled
                 );
                 if uninstalled {
+                    if !show_new_window {
+                        let _ = crate::ipc::close_all_instances();
+                        // leave ipc a little time
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
                     crate::ipc::set_option("stop-service", "Y");
-                    // leave ipc a little time
-                    std::thread::sleep(std::time::Duration::from_millis(300));
                     std::process::Command::new("launchctl")
                         .args(&["remove", &format!("{}_server", crate::get_full_name())])
                         .status()
                         .ok();
-                    std::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(&format!(
-                            "sleep 0.5; open /Applications/{}.app",
-                            crate::get_app_name(),
-                        ))
-                        .spawn()
-                        .ok();
+                    if show_new_window {
+                        std::process::Command::new("open")
+                            .arg("-n")
+                            .arg(&format!("/Applications/{}.app", crate::get_app_name()))
+                            .spawn()
+                            .ok();
+                        // leave open a little time
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
                     quit_gui();
                 }
             }
         }
-    });
+    };
+    if sync {
+        func();
+    } else {
+        std::thread::spawn(func);
+    }
     true
 }
 
@@ -229,7 +305,29 @@ pub fn get_cursor_pos() -> Option<(i32, i32)> {
     */
 }
 
+pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
+    autoreleasepool(|| unsafe_get_focused_display(displays))
+}
+
+fn unsafe_get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
+    unsafe {
+        let main_screen: id = msg_send![class!(NSScreen), mainScreen];
+        let screen: id = msg_send![main_screen, deviceDescription];
+        let id: id =
+            msg_send![screen, objectForKey: NSString::alloc(nil).init_str("NSScreenNumber")];
+        let display_name: u32 = msg_send![id, unsignedIntValue];
+
+        displays
+            .iter()
+            .position(|d| d.name == display_name.to_string())
+    }
+}
+
 pub fn get_cursor() -> ResultType<Option<u64>> {
+    autoreleasepool(|| unsafe_get_cursor())
+}
+
+fn unsafe_get_cursor() -> ResultType<Option<u64>> {
     unsafe {
         let seed = CGSCurrentCursorSeed();
         if seed == LATEST_SEED {
@@ -294,8 +392,12 @@ fn get_cursor_id() -> ResultType<(id, u64)> {
     }
 }
 
-// https://github.com/stweil/OSXvnc/blob/master/OSXvnc-server/mousecursor.c
 pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
+    autoreleasepool(|| unsafe_get_cursor_data(hcursor))
+}
+
+// https://github.com/stweil/OSXvnc/blob/master/OSXvnc-server/mousecursor.c
+fn unsafe_get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
     unsafe {
         let (c, hcursor2) = get_cursor_id()?;
         if hcursor != hcursor2 {
@@ -321,11 +423,11 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
         */
         let mut colors: Vec<u8> = Vec::new();
         colors.reserve((size.height * size.width) as usize * 4);
-        // TIFF is rgb colrspace, no need to convert
+        // TIFF is rgb colorspace, no need to convert
         // let cs: id = msg_send![class!(NSColorSpace), sRGBColorSpace];
         for y in 0..(size.height as _) {
             for x in 0..(size.width as _) {
-                let color: id = msg_send![rep, colorAtX:x y:y];
+                let color: id = msg_send![rep, colorAtX:x as cocoa::foundation::NSInteger y:y as cocoa::foundation::NSInteger];
                 // let color: id = msg_send![color, colorUsingColorSpace: cs];
                 if color == nil {
                     continue;
@@ -374,6 +476,17 @@ pub fn get_active_userid() -> String {
     get_active_user("-n")
 }
 
+pub fn get_active_user_home() -> Option<PathBuf> {
+    let username = get_active_username();
+    if !username.is_empty() {
+        let home = PathBuf::from(format!("/Users/{}", username));
+        if home.exists() {
+            return Some(home);
+        }
+    }
+    None
+}
+
 pub fn is_prelogin() -> bool {
     get_active_userid() == "0"
 }
@@ -382,12 +495,12 @@ pub fn is_root() -> bool {
     crate::username() == "root"
 }
 
-pub fn run_as_user(arg: &str) -> ResultType<Option<std::process::Child>> {
+pub fn run_as_user(arg: Vec<&str>) -> ResultType<Option<std::process::Child>> {
     let uid = get_active_userid();
     let cmd = std::env::current_exe()?;
-    let task = std::process::Command::new("launchctl")
-        .args(vec!["asuser", &uid, cmd.to_str().unwrap_or(""), arg])
-        .spawn()?;
+    let mut args = vec!["asuser", &uid, cmd.to_str().unwrap_or("")];
+    args.append(&mut arg.clone());
+    let task = std::process::Command::new("launchctl").args(args).spawn()?;
     Ok(Some(task))
 }
 
@@ -401,43 +514,7 @@ pub fn lock_screen() {
 }
 
 pub fn start_os_service() {
-    let exe = std::env::current_exe().unwrap_or_default();
-    let tm0 = hbb_common::get_modified_time(&exe);
-    log::info!("{}", crate::username());
-
-    std::thread::spawn(move || loop {
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            let now = hbb_common::get_modified_time(&exe);
-            if now != tm0 && now != std::time::UNIX_EPOCH {
-                // sleep a while to wait for resources file ready
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                println!("{:?} updated, will restart", exe);
-                // this won't kill myself
-                std::process::Command::new("pkill")
-                    .args(&["-f", &crate::get_app_name()])
-                    .status()
-                    .ok();
-                println!("The others killed");
-                // launchctl load/unload/start agent not work in daemon, show not priviledged.
-                // sudo launchctl asuser 501 open -n also not allowed.
-                std::process::Command::new("launchctl")
-                    .args(&[
-                        "asuser",
-                        &get_active_userid(),
-                        "open",
-                        "-a",
-                        &exe.to_str().unwrap_or(""),
-                        "--args",
-                        "--server",
-                    ])
-                    .status()
-                    .ok();
-                std::process::exit(0);
-            }
-        }
-    });
-
+    log::info!("Username: {}", crate::username());
     if let Err(err) = crate::ipc::start("_service") {
         log::error!("Failed to start ipc_service: {}", err);
     }
@@ -488,7 +565,7 @@ pub fn start_os_service() {
                     Err(err) => {
                         log::error!("Failed to start server: {}", err);
                     }
-                    _ => { /*no hapen*/ }
+                    _ => { /*no happen*/ }
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(super::SERVICE_INTERVAL));
@@ -505,8 +582,8 @@ pub fn toggle_blank_screen(_v: bool) {
     // https://unix.stackexchange.com/questions/17115/disable-keyboard-mouse-temporarily
 }
 
-pub fn block_input(_v: bool) -> bool {
-    true
+pub fn block_input(_v: bool) -> (bool, String) {
+    (true, "".to_owned())
 }
 
 pub fn is_installed() -> bool {
@@ -520,8 +597,172 @@ pub fn is_installed() -> bool {
 }
 
 pub fn quit_gui() {
-    use cocoa::appkit::NSApp;
     unsafe {
         let () = msg_send!(NSApp(), terminate: nil);
     };
+}
+
+pub fn get_double_click_time() -> u32 {
+    // to-do: https://github.com/servo/core-foundation-rs/blob/786895643140fa0ee4f913d7b4aeb0c4626b2085/cocoa/src/appkit.rs#L2823
+    500 as _
+}
+
+pub fn hide_dock() {
+    unsafe {
+        NSApp().setActivationPolicy_(NSApplicationActivationPolicyAccessory);
+    }
+}
+
+#[inline]
+fn get_server_start_time_of(p: &Process, path: &Path) -> Option<i64> {
+    let cmd = p.cmd();
+    if cmd.len() <= 1 {
+        return None;
+    }
+    if &cmd[1] != "--server" {
+        return None;
+    }
+    let Ok(cur) = std::fs::canonicalize(p.exe()) else {
+        return None;
+    };
+    if &cur != path {
+        return None;
+    }
+    Some(p.start_time() as _)
+}
+
+#[inline]
+fn get_server_start_time(sys: &mut System, path: &Path) -> Option<(i64, Pid)> {
+    sys.refresh_processes_specifics(ProcessRefreshKind::new());
+    for (_, p) in sys.processes() {
+        if let Some(t) = get_server_start_time_of(p, path) {
+            return Some((t, p.pid() as _));
+        }
+    }
+    None
+}
+
+pub fn handle_application_should_open_untitled_file() {
+    hbb_common::log::debug!("icon clicked on finder");
+    let x = std::env::args().nth(1).unwrap_or_default();
+    if x == "--server" || x == "--cm" || x == "--tray" {
+        std::thread::spawn(move || crate::handle_url_scheme("".to_lowercase()));
+    }
+}
+
+pub fn resolutions(name: &str) -> Vec<Resolution> {
+    let mut v = vec![];
+    if let Ok(display) = name.parse::<u32>() {
+        let mut num = 0;
+        unsafe {
+            if YES == MacGetModeNum(display, &mut num) {
+                let (mut widths, mut heights) = (vec![0; num as _], vec![0; num as _]);
+                let mut real_num = 0;
+                if YES
+                    == MacGetModes(
+                        display,
+                        widths.as_mut_ptr(),
+                        heights.as_mut_ptr(),
+                        num,
+                        &mut real_num,
+                    )
+                {
+                    if real_num <= num {
+                        for i in 0..real_num {
+                            let resolution = Resolution {
+                                width: widths[i as usize] as _,
+                                height: heights[i as usize] as _,
+                                ..Default::default()
+                            };
+                            if !v.contains(&resolution) {
+                                v.push(resolution);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    v
+}
+
+pub fn current_resolution(name: &str) -> ResultType<Resolution> {
+    let display = name.parse::<u32>().map_err(|e| anyhow!(e))?;
+    unsafe {
+        let (mut width, mut height) = (0, 0);
+        if NO == MacGetMode(display, &mut width, &mut height) {
+            bail!("MacGetMode failed");
+        }
+        Ok(Resolution {
+            width: width as _,
+            height: height as _,
+            ..Default::default()
+        })
+    }
+}
+
+pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> ResultType<()> {
+    let display = name.parse::<u32>().map_err(|e| anyhow!(e))?;
+    unsafe {
+        if NO == MacSetMode(display, width as _, height as _) {
+            bail!("MacSetMode failed");
+        }
+    }
+    Ok(())
+}
+
+pub fn check_super_user_permission() -> ResultType<bool> {
+    unsafe { Ok(MacCheckAdminAuthorization() == YES) }
+}
+
+pub fn elevate(args: Vec<&str>, prompt: &str) -> ResultType<bool> {
+    let cmd = std::env::current_exe()?;
+    match cmd.to_str() {
+        Some(cmd) => {
+            let mut cmd_with_args = cmd.to_string();
+            for arg in args {
+                cmd_with_args = format!("{} {}", cmd_with_args, arg);
+            }
+            let script = format!(
+                r#"do shell script "{}" with prompt "{}" with administrator privileges"#,
+                cmd_with_args, prompt
+            );
+            match std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(script)
+                .arg(&get_active_username())
+                .status()
+            {
+                Err(e) => {
+                    bail!("Failed to run osascript: {}", e);
+                }
+                Ok(status) => Ok(status.success() && status.code() == Some(0)),
+            }
+        }
+        None => {
+            bail!("Failed to get current exe str");
+        }
+    }
+}
+
+pub struct WakeLock(Option<keepawake::AwakeHandle>);
+
+impl WakeLock {
+    pub fn new(display: bool, idle: bool, sleep: bool) -> Self {
+        WakeLock(
+            keepawake::Builder::new()
+                .display(display)
+                .idle(idle)
+                .sleep(sleep)
+                .create()
+                .ok(),
+        )
+    }
+
+    pub fn set_display(&mut self, display: bool) -> ResultType<()> {
+        self.0
+            .as_mut()
+            .map(|h| h.set_display(display))
+            .ok_or(anyhow!("no AwakeHandle"))?
+    }
 }

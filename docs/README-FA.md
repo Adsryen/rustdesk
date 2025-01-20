@@ -1,60 +1,49 @@
-<p align="center">
+<p dir="rtl" align="center">
   <img src="../res/logo-header.svg" alt="RustDesk - Your remote desktop"><br>
-  <a dir="rtl" href="#اسکرین-شات-ها">اسنپ شات</a> •
-  <a dir="rtl" href="#ساختار-پوشه-ها">ساختار</a> •
-  <a dir="rtl" href="#نحوه-ساخت-با-داکر">داکر</a> •
-  <a dir="rtl" href="#ساخت">ساخت</a> •
-  <a dir="rtl" href="#سرورهای-عمومی-رایگان">سرور</a><br>
-  [<a href="docs/README-CS.md">česky</a>] | [<a href="docs/README-ZH.md">中文</a>] | | [<a href="docs/README-HU.md">Magyar</a>] | [<a href="docs/README-ES.md">Español</a>] | [<a href="docs/README-FA.md">فارسی</a>] | [<a href="docs/README-FR.md">Français</a>] | [<a href="docs/README-DE.md">Deutsch</a>] | [<a href="docs/README-PL.md">Polski</a>] | [<a href="docs/README-ID.md">Indonesian</a>] | [<a href="docs/README-FI.md">Suomi</a>] | [<a href="docs/README-ML.md">മലയാളം</a>] | [<a href="docs/README-JP.md">日本語</a>] | [<a href="docs/README-NL.md">Nederlands</a>] | [<a href="docs/README-IT.md">Italiano</a>] | [<a href="docs/README-RU.md">Русский</a>] | [<a href="docs/README-PTBR.md">Português (Brasil)</a>] | [<a href="docs/README-EO.md">Esperanto</a>] | [<a href="docs/README-KR.md">한국어</a>] | [<a href="docs/README-AR.md">العربي</a>] | [<a href="docs/README-VN.md">Tiếng Việt</a>]<br>
-  &#x202b;<b>برای ترجمه این  <a href="https://github.com/rustdesk/rustdesk/tree/master/src/lang"> RustDesk UI</a>  ،README  و <a href="https://github.com/rustdesk/doc.rustdesk.com">Doc</a> به زبان مادری شما به کمکتون نیاز داریم
+  <a href="#تصاویر-محیط-نرم افزار">تصاویر محیط نرم‌افزار</a> •
+  <a href="#ساختار-پوشه-ها">ساختار</a> •
+  <a href="#نحوه-ساخت-با-داکر">داکر</a> •
+  <a href="#ساخت">ساخت</a> •
+  <a href="#سرورهای-عمومی-رایگان">سرور</a>
 </p>
+<p align="center" dir="auto">[<a href="../README.md">English</a>] | [<a href="README-UA.md">Українська</a>] | [<a href="README-CS.md">česky</a>] | [<a href="README-ZH.md">中文</a>] | [<a href="README-HU.md">Magyar</a>] | [<a href="README-ES.md">Español</a>] | [<a href="README-FR.md">Français</a>] | [<a href="README-DE.md">Deutsch</a>] | [<a href="README-PL.md">Polski</a>] | [<a href="README-ID.md">Indonesian</a>] | [<a href="README-FI.md">Suomi</a>] | [<a href="README-ML.md">മലയാളം</a>] | [<a href="README-JP.md">日本語</a>] | [<a href="README-NL.md">Nederlands</a>] | [<a href="README-IT.md">Italiano</a>] | [<a href="README-RU.md">Русский</a>] | [<a href="README-PTBR.md">Português (Brasil)</a>] | [<a href="README-EO.md">Esperanto</a>] | [<a href="README-KR.md">한국어</a>] | [<a href="README-AR.md">العربي</a>] | [<a href="README-VN.md">Tiếng Việt</a>] | [<a href="README-GR.md">Ελληνικά</a>]</p>
+<p dir="rtl" align="center"><b>برای ترجمه این سند (README)، <a href="https://github.com/rustdesk/rustdesk/tree/master/src/lang" dir="rtl">رابط کاربری RustDesk</a>، <a href="https://github.com/rustdesk/doc.rustdesk.com" dir="rtl">و مستندات آن</a> به زبان مادری شما به کمکتان نیازمندیم. </b></p>
 
-با ما گپ بزنید:  [Reddit](https://www.reddit.com/r/rustdesk) | [Twitter](https://twitter.com/rustdesk) | [Discord](https://discord.gg/nDceKgxnkV) 
+با ما گفتگو کنید:  [Reddit](https://www.reddit.com/r/rustdesk) | [Twitter](https://twitter.com/rustdesk) | [Discord](https://discord.gg/nDceKgxnkV) 
 
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/I2I04VU09)
 
-یک نرم افزار دیگر کنترل دسکتاپ از راه دور، که با Rust نوشته شده است. راه اندازی سریع وبدون نیاز به تنظیمات. شما کنترل کاملی بر داده های خود دارید، بدون هیچ گونه نگرانی امنیتی.
+راست‌دسک (RustDesk) نرم‌افزاری برای کارکردن با رایانه‌ی رومیزی از راه دور است و با زبان برنامه‌نویسی Rust نوشته شده است. نیاز به تنظیمات چندانی ندارد و شما را قادر می سازد تا بدون نگرانی از امنیت اطلاعات خود بر آن‌ها کنترل کامل داشته باشید.
+
 می‌توانید از سرور rendezvous/relay ما استفاده کنید، [سرور خودتان را راه‌اندازی کنید](https://rustdesk.com/server) یا
 [ سرورrendezvous/relay  خود را بنویسید](https://github.com/rustdesk/rustdesk).
 
-&#x202b;راست دسک (RustDesk) از مشارکت همه استقبال می کند. برای راهنمایی جهت مشارکت به [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) مراجعه کنید.
+ما از مشارکت همه استقبال می کنیم. برای راهنمایی جهت مشارکت به[`docs/CONTRIBUTING.md`](CONTRIBUTING.md) مراجعه کنید.
 
-[راست دسک چطور کار می کند؟](https://github.com/rustdesk/rustdesk/wiki/How-does-RustDesk-work%3F)
+[راست‌دسک چطور کار می کند؟](https://github.com/rustdesk/rustdesk/wiki/How-does-RustDesk-work%3F)
 
-[دانلود باینری](https://github.com/rustdesk/rustdesk/releases)
-
-## سرورهای عمومی رایگان
-
-سرورهایی  زیر را  به صورت رایگان میتوانید استفاده می کنید. این لیست ممکن است در طول زمان تغییر کند. اگر به این سرورها نزدیک نیستید، ممکن است سرویس شما کند شود.
-| موقعیت | سرویس دهنده | مشخصات |
-| --------- | ------------- | ------------------ |
-| Seoul | AWS lightsail | 1 VCPU / 0.5GB RAM |
-| Singapore | Vultr | 1 VCPU / 1GB RAM |
-| Dallas | Vultr | 1 VCPU / 1GB RAM | |
-| Germany | Hetzner | 2 VCPU / 4GB RAM |
-| Germany | Codext | 4 VCPU / 8GB RAM |
+[دریافت نرم‌افزار](https://github.com/rustdesk/rustdesk/releases)
 
 ## وابستگی ها
 
-نسخه‌های دسکتاپ از [sciter](https://sciter.com/) برای رابط کاربری گرافیکی استفاده می‌کنند، لطفا کتابخانه پویا sciter را خودتان دانلود کنید.
+نسخه‌های رومیزی از [sciter](https://sciter.com/) برای رابط کاربری گرافیکی استفاده می‌کنند. خواهشمندیم کتابخانه‌ی پویای sciter را خودتان دانلود کنید از این منابع دریافت کنید.
 
-[ویندوز](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.win/x64/sciter.dll) |
-[لینوکس](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so) |
-[مک](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.osx/libsciter.dylib)
+- [ویندوز](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.win/x64/sciter.dll)
+- [لینوکس](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so)
+- [مک](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.osx/libsciter.dylib)
 
-نسخه های موبایل از Flutter استفاده می کنند. بعداً نسخه دسکتاپ را از Sciter به Flutter منتقل خواهیم کرد.
+نسخه های همراه از Flutter استفاده می کنند. نسخه‌ی رومیزی را هم از Sciter به Flutter منتقل خواهیم کرد.
 
-## مراحل بنیادین برای ساخت
+## نیازمندی‌های ساخت
 
-&#x202b;- محیط توسعه نرم افزار Rust و محیط ساخت ++C خود را آماده کنید
+- محیط توسعه نرم افزار Rust و محیط ساخت ++C خود را آماده کنید
 
-&#x202b;- نرم افزار [vcpkg](https://github.com/microsoft/vcpkg) را نصب کنید و متغیر `VCPKG_ROOT` را به درستی تنظیم کنید:
-
-  - Windows: `vcpkg install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static`
-  - Linux/MacOS: `vcpkg install libvpx libyuv opus`
-
-- run `cargo run`
+- نرم افزار [vcpkg](https://github.com/microsoft/vcpkg) را نصب کنید و متغیر `VCPKG_ROOT` را به درستی تنظیم کنید.
+- بسته‌های vcpkg مورد نیاز را نصب کنید:
+  - ویندوز: `vcpkg install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static aom:x64-windows-static`
+  - مک و لینوکس: `vcpkg install libvpx libyuv opus aom`
+- این دستور را اجرا کنید: `cargo run`
 
 ## [ساخت](https://rustdesk.com/docs/en/dev/build/)
 
@@ -83,11 +72,11 @@ sudo pacman -Syu --needed unzip git cmake gcc curl wget yasm nasm zip make pkg-c
 ```sh
 git clone https://github.com/microsoft/vcpkg
 cd vcpkg
-git checkout 2021.12.01
+git checkout 2023.04.15
 cd ..
 vcpkg/bootstrap-vcpkg.sh
 export VCPKG_ROOT=$HOME/vcpkg
-vcpkg/vcpkg install libvpx libyuv opus
+vcpkg/vcpkg install libvpx libyuv opus aom
 ```
 
 ### رفع ایراد libvpx (برای فدورا)
@@ -116,13 +105,9 @@ mv libsciter-gtk.so target/debug
 VCPKG_ROOT=$HOME/vcpkg cargo run
 ```
 
-### تغییر Wayland به (X11 (Xorg
-
-راست دسک از Wayland پشتیبانی نمی کند. برای جایگزنی Xorg به عنوان پیش‌فرض GNOM، [اینجا](https://docs.fedoraproject.org/en-US/quick-docs/configuring-xorg-as-default-gnome-session/) را کلیک کنید.
-
 ## نحوه ساخت با داکر
 
-این مخزن گیت را کلون کنید و کانتینر را به روش زیر بسازید
+این مخزن Git را دریافت کنید و کانتینر را به روش زیر بسازید
 
 ```sh
 git clone https://github.com/rustdesk/rustdesk
@@ -130,13 +115,13 @@ cd rustdesk
 docker build -t "rustdesk-builder" .
 ```
 
-سپس، هر بار که نیاز به ساخت اپلیکیشن داشتید، دستور زیر را اجرا کنید:
+سپس، هر بار که نیاز به ساخت نرم‌افزار داشتید، دستور زیر را اجرا کنید:
 
 ```sh
 docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user/.cargo/git -v rustdesk-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" rustdesk-builder
 ```
 
-توجه داشته باشید که ساخت اول ممکن است قبل از کش شدن وابستگی ها بیشتر طول بکشد، دفعات بعدی سریعتر خواهند بود. علاوه بر این، اگر نیاز به تعیین آرگومان های مختلف برای دستور ساخت دارید، می توانید این کار را در انتهای دستور ساخت و از طریق `<OPTIONAL-ARGS>` انجام دهید. به عنوان مثال، اگر می خواهید یک نسخه نهایی بهینه سازی شده ایجاد کنید، دستور بالا را تایپ کنید و در انتها  `release--` را اضافه کنید. فایل اجرایی به دست آمده در پوشه مقصد در سیستم شما در دسترس خواهد بود و می تواند با دستور:
+توجه داشته باشید که نخستین ساخت ممکن است به دلیل محلی نبودن وابستگی‌ها بیشتر طول بکشد. اما دفعات بعدی سریعتر خواهند بود. علاوه بر این، اگر نیاز به تعیین آرگومان های مختلف برای دستور ساخت دارید، می توانید این کار را در انتهای دستور ساخت و از طریق `<OPTIONAL-ARGS>` انجام دهید. به عنوان مثال، اگر می خواهید یک نسخه نهایی بهینه سازی شده ایجاد کنید، دستور بالا را تایپ کنید و در انتها  `release--` را اضافه کنید. فایل اجرایی به دست آمده در پوشه مقصد در سیستم شما در دسترس خواهد بود و می تواند با دستور:
 
 ```sh
 target/debug/rustdesk
@@ -163,7 +148,7 @@ target/release/rustdesk
 - **[flutter](https://github.com/rustdesk/rustdesk/tree/master/flutter)**: Flutter code for mobile
 - **[flutter/web/js](https://github.com/rustdesk/rustdesk/tree/master/flutter/web/js)**: Javascript for Flutter web client
 
-## اسکرین شات ها
+## تصاویر محیط نرم‌افزار
 
 ![image](https://user-images.githubusercontent.com/71636191/113112362-ae4deb80-923b-11eb-957d-ff88daad4f06.png)
 

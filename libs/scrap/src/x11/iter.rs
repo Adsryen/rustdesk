@@ -1,7 +1,9 @@
+use std::ffi::CString;
 use std::ptr;
 use std::rc::Rc;
 
-use libc;
+use crate::Pixfmt;
+use hbb_common::libc;
 
 use super::ffi::*;
 use super::{Display, Rect, Server};
@@ -64,7 +66,8 @@ impl Iterator for DisplayIter {
                 if inner.rem != 0 {
                     unsafe {
                         let data = &*inner.data;
-
+                        let name = get_atom_name(self.server.raw(), data.name);
+                        let pixfmt = get_pixfmt(self.server.raw(), root).unwrap_or(Pixfmt::BGRA);
                         let display = Display::new(
                             self.server.clone(),
                             data.primary != 0,
@@ -75,6 +78,8 @@ impl Iterator for DisplayIter {
                                 h: data.height,
                             },
                             root,
+                            name,
+                            pixfmt,
                         );
 
                         xcb_randr_monitor_info_next(inner);
@@ -89,5 +94,45 @@ impl Iterator for DisplayIter {
             // The current screen was empty, so try the next screen.
             self.inner = Self::next_screen(&mut self.outer, &self.server);
         }
+    }
+}
+
+fn get_atom_name(conn: *mut xcb_connection_t, atom: xcb_atom_t) -> String {
+    let empty = "".to_owned();
+    if atom == 0 {
+        return empty;
+    }
+    unsafe {
+        let mut e: *mut xcb_generic_error_t = std::ptr::null_mut();
+        let reply = xcb_get_atom_name_reply(conn, xcb_get_atom_name(conn, atom), &mut e as _);
+        if reply == std::ptr::null() {
+            return empty;
+        }
+        let length = xcb_get_atom_name_name_length(reply);
+        let name = xcb_get_atom_name_name(reply);
+        let mut v = vec![0u8; length as _];
+        std::ptr::copy_nonoverlapping(name as _, v.as_mut_ptr(), length as _);
+        libc::free(reply as *mut _);
+        if let Ok(s) = CString::new(v) {
+            return s.to_string_lossy().to_string();
+        }
+        empty
+    }
+}
+
+unsafe fn get_pixfmt(conn: *mut xcb_connection_t, root: xcb_window_t) -> Option<Pixfmt> {
+    let geo_cookie = xcb_get_geometry_unchecked(conn, root);
+    let geo = xcb_get_geometry_reply(conn, geo_cookie, ptr::null_mut());
+    if geo.is_null() {
+        return None;
+    }
+    let depth = (*geo).depth;
+    libc::free(geo as _);
+    // now only support little endian
+    // https://github.com/FFmpeg/FFmpeg/blob/a9c05eb657d0d05f3ac79fe9973581a41b265a5e/libavdevice/xcbgrab.c#L519
+    match depth {
+        16 => Some(Pixfmt::RGB565LE),
+        32 => Some(Pixfmt::BGRA),
+        _ => None,
     }
 }

@@ -1,16 +1,19 @@
 use super::xdo::EnigoXdo;
-use crate::{Key, KeyboardControllable, MouseButton, MouseControllable};
+use crate::{Key, KeyboardControllable, MouseButton, MouseControllable, ResultType};
 use std::io::Read;
 use tfc::{traits::*, Context as TFC_Context, Key as TFC_Key};
+
+pub type CustomKeyboard = Box<dyn KeyboardControllable + Send>;
+pub type CustomMouce = Box<dyn MouseControllable + Send>;
 
 /// The main struct for handling the event emitting
 // #[derive(Default)]
 pub struct Enigo {
     xdo: EnigoXdo,
     is_x11: bool,
-    tfc: TFC_Context,
-    uinput_keyboard: Option<Box<dyn KeyboardControllable + Send>>,
-    uinput_mouse: Option<Box<dyn MouseControllable + Send>>,
+    tfc: Option<TFC_Context>,
+    custom_keyboard: Option<CustomKeyboard>,
+    custom_mouse: Option<CustomMouce>,
 }
 
 impl Enigo {
@@ -18,76 +21,135 @@ impl Enigo {
     pub fn delay(&self) -> u64 {
         self.xdo.delay()
     }
-    /// Set delay of xdo implemetation.
+    /// Set delay of xdo implementation.
     pub fn set_delay(&mut self, delay: u64) {
         self.xdo.set_delay(delay)
     }
-    /// Set uinput keyboard.
-    pub fn set_uinput_keyboard(
-        &mut self,
-        uinput_keyboard: Option<Box<dyn KeyboardControllable + Send>>,
-    ) {
-        self.uinput_keyboard = uinput_keyboard
+    /// Set custom keyboard.
+    pub fn set_custom_keyboard(&mut self, custom_keyboard: CustomKeyboard) {
+        self.custom_keyboard = Some(custom_keyboard)
     }
-    /// Set uinput mouse.
-    pub fn set_uinput_mouse(&mut self, uinput_mouse: Option<Box<dyn MouseControllable + Send>>) {
-        self.uinput_mouse = uinput_mouse
+    /// Set custom mouse.
+    pub fn set_custom_mouse(&mut self, custom_mouse: CustomMouce) {
+        self.custom_mouse = Some(custom_mouse)
+    }
+    /// Get custom keyboard.
+    pub fn get_custom_keyboard(&mut self) -> &mut Option<CustomKeyboard> {
+        &mut self.custom_keyboard
+    }
+    /// Get custom mouse.
+    pub fn get_custom_mouse(&mut self) -> &mut Option<CustomMouce> {
+        &mut self.custom_mouse
+    }
+
+    /// Clear remapped keycodes
+    pub fn tfc_clear_remapped(&mut self) {
+        if let Some(tfc) = &mut self.tfc {
+            tfc.recover_remapped_keycodes();
+        }
+    }
+
+    fn tfc_key_click(&mut self, key: Key) -> ResultType {
+        if let Some(tfc) = &mut self.tfc {
+            let res = match key {
+                Key::Layout(chr) => tfc.unicode_char(chr),
+                key => {
+                    let tfc_key: TFC_Key = match convert_to_tfc_key(key) {
+                        Some(key) => key,
+                        None => {
+                            return Err(format!("Failed to convert {:?} to TFC_Key", key).into());
+                        }
+                    };
+                    tfc.key_click(tfc_key)
+                }
+            };
+            if res.is_err() {
+                Err(format!("Failed to click {:?} by tfc", key).into())
+            } else {
+                Ok(())
+            }
+        } else {
+            Err("Not Found TFC".into())
+        }
     }
 
     fn tfc_key_down_or_up(&mut self, key: Key, down: bool, up: bool) -> bool {
-        if let Key::Layout(chr) = key {
-            if down {
-                if let Err(_) = self.tfc.unicode_char_down(chr) {
-                    return false;
+        match &mut self.tfc {
+            None => false,
+            Some(tfc) => {
+                if let Key::Layout(chr) = key {
+                    if down {
+                        if let Err(_) = tfc.unicode_char_down(chr) {
+                            return false;
+                        }
+                    }
+                    if up {
+                        if let Err(_) = tfc.unicode_char_up(chr) {
+                            return false;
+                        }
+                    }
+                    return true;
                 }
+                let key = match convert_to_tfc_key(key) {
+                    Some(key) => key,
+                    None => {
+                        return false;
+                    }
+                };
+
+                if down {
+                    if let Err(_) = tfc.key_down(key) {
+                        return false;
+                    }
+                };
+                if up {
+                    if let Err(_) = tfc.key_up(key) {
+                        return false;
+                    }
+                };
+                return true;
             }
-            if up {
-                if let Err(_) = self.tfc.unicode_char_up(chr) {
-                    return false;
-                }
-            }
-            return true;
         }
-
-        let key = match convert_to_tfc_key(key) {
-            Some(key) => key,
-            None => {
-                return false;
-            }
-        };
-
-        if down {
-            if let Err(_) = self.tfc.key_down(key) {
-                return false;
-            }
-        };
-        if up {
-            if let Err(_) = self.tfc.key_up(key) {
-                return false;
-            }
-        };
-        return true;
     }
 }
 
 impl Default for Enigo {
     fn default() -> Self {
+        let is_x11 = hbb_common::platform::linux::is_x11_or_headless();
         Self {
-            is_x11: "x11" == hbb_common::platform::linux::get_display_server(),
-            tfc: TFC_Context::new().expect("kbd context error"),
-            uinput_keyboard: None,
-            uinput_mouse: None,
+            is_x11,
+            tfc: if is_x11 {
+                match TFC_Context::new() {
+                    Ok(ctx) => Some(ctx),
+                    Err(..) => {
+                        println!("kbd context error");
+                        None
+                    }
+                }
+            } else {
+                None
+            },
+            custom_keyboard: None,
+            custom_mouse: None,
             xdo: EnigoXdo::default(),
         }
     }
 }
 
 impl MouseControllable for Enigo {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn mouse_move_to(&mut self, x: i32, y: i32) {
         if self.is_x11 {
             self.xdo.mouse_move_to(x, y);
         } else {
-            if let Some(mouse) = &mut self.uinput_mouse {
+            if let Some(mouse) = &mut self.custom_mouse {
                 mouse.mouse_move_to(x, y)
             }
         }
@@ -96,7 +158,7 @@ impl MouseControllable for Enigo {
         if self.is_x11 {
             self.xdo.mouse_move_relative(x, y);
         } else {
-            if let Some(mouse) = &mut self.uinput_mouse {
+            if let Some(mouse) = &mut self.custom_mouse {
                 mouse.mouse_move_relative(x, y)
             }
         }
@@ -105,7 +167,7 @@ impl MouseControllable for Enigo {
         if self.is_x11 {
             self.xdo.mouse_down(button)
         } else {
-            if let Some(mouse) = &mut self.uinput_mouse {
+            if let Some(mouse) = &mut self.custom_mouse {
                 mouse.mouse_down(button)
             } else {
                 Ok(())
@@ -116,7 +178,7 @@ impl MouseControllable for Enigo {
         if self.is_x11 {
             self.xdo.mouse_up(button)
         } else {
-            if let Some(mouse) = &mut self.uinput_mouse {
+            if let Some(mouse) = &mut self.custom_mouse {
                 mouse.mouse_up(button)
             }
         }
@@ -125,7 +187,7 @@ impl MouseControllable for Enigo {
         if self.is_x11 {
             self.xdo.mouse_click(button)
         } else {
-            if let Some(mouse) = &mut self.uinput_mouse {
+            if let Some(mouse) = &mut self.custom_mouse {
                 mouse.mouse_click(button)
             }
         }
@@ -134,7 +196,7 @@ impl MouseControllable for Enigo {
         if self.is_x11 {
             self.xdo.mouse_scroll_x(length)
         } else {
-            if let Some(mouse) = &mut self.uinput_mouse {
+            if let Some(mouse) = &mut self.custom_mouse {
                 mouse.mouse_scroll_x(length)
             }
         }
@@ -143,7 +205,7 @@ impl MouseControllable for Enigo {
         if self.is_x11 {
             self.xdo.mouse_scroll_y(length)
         } else {
-            if let Some(mouse) = &mut self.uinput_mouse {
+            if let Some(mouse) = &mut self.custom_mouse {
                 mouse.mouse_scroll_y(length)
             }
         }
@@ -152,6 +214,7 @@ impl MouseControllable for Enigo {
 
 fn get_led_state(key: Key) -> bool {
     let led_file = match key {
+        // FIXME: the file may be /sys/class/leds/input2 or input5 ...
         Key::CapsLock => "/sys/class/leds/input1::capslock/brightness",
         Key::NumLock => "/sys/class/leds/input1::numlock/brightness",
         _ => {
@@ -171,11 +234,19 @@ fn get_led_state(key: Key) -> bool {
 }
 
 impl KeyboardControllable for Enigo {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn get_key_state(&mut self, key: Key) -> bool {
         if self.is_x11 {
             self.xdo.get_key_state(key)
         } else {
-            if let Some(keyboard) = &mut self.uinput_keyboard {
+            if let Some(keyboard) = &mut self.custom_keyboard {
                 keyboard.get_key_state(key)
             } else {
                 get_led_state(key)
@@ -183,11 +254,12 @@ impl KeyboardControllable for Enigo {
         }
     }
 
+    /// Warning: Get 6^ in French.
     fn key_sequence(&mut self, sequence: &str) {
         if self.is_x11 {
             self.xdo.key_sequence(sequence)
         } else {
-            if let Some(keyboard) = &mut self.uinput_keyboard {
+            if let Some(keyboard) = &mut self.custom_keyboard {
                 keyboard.key_sequence(sequence)
             }
         }
@@ -202,7 +274,7 @@ impl KeyboardControllable for Enigo {
                 Ok(())
             }
         } else {
-            if let Some(keyboard) = &mut self.uinput_keyboard {
+            if let Some(keyboard) = &mut self.custom_keyboard {
                 keyboard.key_down(key)
             } else {
                 Ok(())
@@ -216,14 +288,16 @@ impl KeyboardControllable for Enigo {
                 self.xdo.key_up(key)
             }
         } else {
-            if let Some(keyboard) = &mut self.uinput_keyboard {
+            if let Some(keyboard) = &mut self.custom_keyboard {
                 keyboard.key_up(key)
             }
         }
     }
     fn key_click(&mut self, key: Key) {
-        self.key_down(key).ok();
-        self.key_up(key);
+        if self.tfc_key_click(key).is_err() {
+            self.key_down(key).ok();
+            self.key_up(key);
+        }
     }
 }
 
@@ -271,7 +345,7 @@ fn convert_to_tfc_key(key: Key) -> Option<TFC_Key> {
         Key::Numpad9 => TFC_Key::N9,
         Key::Decimal => TFC_Key::NumpadDecimal,
         Key::Clear => TFC_Key::NumpadClear,
-        Key::Pause => TFC_Key::PlayPause,
+        Key::Pause => TFC_Key::Pause,
         Key::Print => TFC_Key::Print,
         Key::Snapshot => TFC_Key::PrintScreen,
         Key::Insert => TFC_Key::Insert,
@@ -294,4 +368,11 @@ fn convert_to_tfc_key(key: Key) -> Option<TFC_Key> {
         }
     };
     Some(key)
+}
+
+#[test]
+fn test_key_seq() {
+    // Get 6^ in French.
+    let mut en = Enigo::new();
+    en.key_sequence("^^");
 }

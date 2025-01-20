@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use block::RcBlock;
-use libc::c_void;
+use hbb_common::libc::c_void;
 
 pub type CGDisplayStreamRef = *mut c_void;
 pub type CFDictionaryRef = *mut c_void;
@@ -193,6 +193,7 @@ extern "C" {
     pub fn CGDisplayIsOnline(display: u32) -> i32;
 
     pub fn CGDisplayBounds(display: u32) -> CGRect;
+    pub fn BackingScaleFactor(display: u32) -> f32;
 
     // IOSurface
 
